@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="私密語音／螢幕分享房間：房間碼＋密碼加入，WebRTC 點對點加密">
+  <title>Room — 私密語音・螢幕分享房間</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🏠</text></svg>">
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+
+  <!-- ================= 大廳 ================= -->
+  <div id="view-lobby" class="view">
+    <header class="lobby-header">
+      <h1>🏠 Room</h1>
+      <p class="muted">建立私密房間，用「房間碼＋密碼」邀請朋友，麥克風交談、螢幕共享（1080p・最高 120fps）。</p>
+    </header>
+
+    <div class="nickname-row">
+      <label for="nickname">你的暱稱</label>
+      <input id="nickname" maxlength="20" placeholder="例如：小明" autocomplete="nickname">
+    </div>
+
+    <main class="cards">
+      <section class="card">
+        <h2>✨ 創建房間</h2>
+        <label for="create-name">房間名稱</label>
+        <input id="create-name" maxlength="40" placeholder="例如：週末遊戲團" autocomplete="off">
+        <label for="create-password">房間密碼（你自己設定）</label>
+        <input id="create-password" type="password" maxlength="64" placeholder="至少 4 字" autocomplete="new-password">
+        <button id="btn-create" class="primary">建房間（我是房主）</button>
+        <p class="muted small">建立後會產生一組 6 位房間碼，把它和密碼告訴朋友。</p>
+      </section>
+
+      <section class="card">
+        <h2>🚪 加入房間</h2>
+        <label for="join-code">房間碼</label>
+        <input id="join-code" maxlength="6" placeholder="6 位英文數字" autocomplete="off" class="code-input">
+        <label for="join-password">房間密碼</label>
+        <input id="join-password" type="password" maxlength="64" placeholder="房主設定的密碼" autocomplete="current-password">
+        <button id="btn-join" class="primary">加入房間</button>
+        <p class="muted small">需要房間碼<strong>和</strong>密碼兩者都正確才能進入。</p>
+      </section>
+    </main>
+
+    <section class="room-list-section">
+      <h2>目前開放的房間</h2>
+      <div id="room-list"><p class="muted">載入中…</p></div>
+    </section>
+  </div>
+
+  <!-- ================= 房間 ================= -->
+  <div id="view-room" class="view hidden">
+    <header class="room-header">
+      <div class="rh-left">
+        <button id="btn-leave" class="ghost">← 離開</button>
+        <div>
+          <div class="room-title-line">
+            <span id="room-name" class="room-name"></span>
+            <span id="owner-badge" class="badge badge-owner hidden">👑 你是房主</span>
+          </div>
+          <div class="room-sub">
+            房間碼 <code id="room-code"></code>
+            <button id="btn-copy-code" class="linkish">複製</button>
+            <span class="dot">·</span>
+            <span id="participant-count"></span>
+          </div>
+        </div>
+      </div>
+      <button id="btn-settings" class="ghost hidden">⚙️ 房間設定</button>
+    </header>
+
+    <div class="controls">
+      <button id="btn-mic" class="ctl">🎤 開啟麥克風</button>
+      <button id="btn-mute" class="ctl" disabled>🔇 靜音</button>
+      <span class="sep"></span>
+      <div class="quality">
+        <label for="quality">分享畫質</label>
+        <select id="quality">
+          <option value="ultra">1080p・最高 120fps（頂級流暢）</option>
+          <option value="text">1080p・60fps（文字清晰）</option>
+          <option value="saver">720p・30fps（省頻寬）</option>
+        </select>
+      </div>
+      <button id="btn-screen" class="ctl">🖥️ 分享螢幕</button>
+    </div>
+    <p class="hint" id="quality-hint">
+      系統會向瀏覽器要求 1920×1080／120fps；角標顯示<strong>實際量測</strong>的解析度與幀率。
+      實際幀率由瀏覽器擷取管線決定：<strong>Safari（macOS）螢幕擷取上限約 30fps</strong>；
+      Chrome／Edge 通常 60fps；更高幀率需要高更新率螢幕與支援的擷取環境（建議用 Chrome 分享）。
+    </p>
+
+    <main id="tiles" class="tiles"></main>
+    <div id="audios" class="hidden"></div>
+  </div>
+
+  <!-- ================= 房主設定彈窗 ================= -->
+  <div id="modal-settings" class="modal hidden">
+    <div class="modal-card">
+      <h2>⚙️ 房間設定（限房主）</h2>
+      <label for="set-name">房間名稱</label>
+      <input id="set-name" maxlength="40" autocomplete="off">
+      <label for="set-password">新密碼</label>
+      <input id="set-password" type="password" maxlength="64" placeholder="留空表示不修改密碼" autocomplete="new-password">
+      <p class="muted small">修改後新加入者需使用新密碼；房間碼不會改變，正在房內的人不受影響。</p>
+      <div class="modal-actions">
+        <button id="btn-settings-cancel" class="ghost">取消</button>
+        <button id="btn-settings-save" class="primary">儲存</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="conn-badge" class="conn-badge">連線中…</div>
+  <div id="toasts"></div>
+
+  <script src="/socket.io/socket.io.js"></script>
+  <script src="js/app.js"></script>
+</body>
+</html>
