@@ -64,6 +64,29 @@
   const tileEls = new Map();
   const audioEls = new Map();
 
+  /* ================= 文字聊天／檔案傳送 ================= */
+  // 聊天與檔案都走既有的 P2P DataConnection（mesh：每對成員之間一條直連通道），
+  // 訊息不經過任何伺服器；檔案以 base64 分片傳送，用 bufferedAmount 做背壓控制。
+  const chat = {
+    open: false,
+    unread: 0,
+    atBottom: true,
+    lastSender: null,
+    lastGroupTs: 0,
+    typing: new Map(),    // peerId -> { name, timer }
+    typingSent: false,
+    typingSentAt: 0,
+    typingOffTimer: null,
+    transfers: new Map(), // fid -> 傳送狀態（收／發共用）
+    urls: [],             // 已建立的 blob URL，離開房間時一併撤銷
+    welcomed: false,
+  };
+  const FILE_CHUNK = 60_000;           // 每片原始位元組（base64 後約 80KB，低於瀏覽器訊息上限）
+  const FILE_MAX = 200 * 1024 * 1024;  // 單一檔案上限
+  const FILE_BUFFER_HIGH = 8 * 1024 * 1024;
+  const fileQueue = [];
+  let fileSending = false;
+
   /* ================= 小工具 ================= */
 
   function el(tag, className, text) {
@@ -71,6 +94,63 @@
     if (className) n.className = className;
     if (text !== undefined) n.textContent = text;
     return n;
+  }
+
+  function icon(name) {
+    const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    svg.setAttribute('class', 'ico');
+    const use = document.createElementNS('http://www.w3.org/2000/svg', 'use');
+    use.setAttribute('href', '#i-' + name);
+    svg.appendChild(use);
+    return svg;
+  }
+
+  function genId() {
+    return Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 9);
+  }
+
+  function nameHue(name) {
+    return [...(name || '?')].reduce((a, c) => a + c.codePointAt(0), 0) % 360;
+  }
+
+  function fmtBytes(n) {
+    if (!Number.isFinite(n)) return '?';
+    if (n < 1024) return n + ' B';
+    const units = ['KB', 'MB', 'GB'];
+    let v = n;
+    let u = -1;
+    do { v /= 1024; u++; } while (v >= 1024 && u < units.length - 1);
+    return (v >= 100 ? Math.round(v) : v.toFixed(1)) + ' ' + units[u];
+  }
+
+  function chatTime(ts) {
+    try { return new Date(ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }); }
+    catch { return ''; }
+  }
+
+  function u8ToB64(u8) {
+    let bin = '';
+    const step = 0x8000;
+    for (let i = 0; i < u8.length; i += step) {
+      bin += String.fromCharCode.apply(null, u8.subarray(i, Math.min(i + step, u8.length)));
+    }
+    return btoa(bin);
+  }
+
+  function b64ToU8(b64) {
+    const bin = atob(b64);
+    const u8 = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+    return u8;
+  }
+
+  function maxBuffered() {
+    let m = 0;
+    for (const [, c] of state.dataConns) {
+      const dc = c.dataChannel || c._dc;
+      if (dc && typeof dc.bufferedAmount === 'number') m = Math.max(m, dc.bufferedAmount);
+    }
+    return m;
   }
 
   function toast(msg, type = 'info') {
@@ -154,7 +234,11 @@
   }
 
   function bitrateFor(q) {
-    return q === 'ultra' ? 16_000_000 : q === 'text' ? 8_000_000 : 3_500_000;
+    return q === 'ultra' ? 24_000_000 : q === 'text' ? 12_000_000 : 3_500_000;
+  }
+
+  function maxFpsFor(q) {
+    return q === 'ultra' ? 120 : q === 'text' ? 60 : 30;
   }
 
   function degradationFor(q) {
@@ -169,7 +253,8 @@
       if (!Array.isArray(p.encodings) || p.encodings.length === 0) p.encodings = [{}];
       const e = p.encodings[0];
       e.maxBitrate = bitrateFor(state.quality);
-      e.maxFramerate = state.quality === 'ultra' ? 120 : state.quality === 'text' ? 60 : 30;
+      e.maxFramerate = maxFpsFor(state.quality);
+      e.scaleResolutionDownBy = 1; // 禁止瀏覽器自動降解析度，保住 1080p
       e.networkPriority = 'high';
       e.priority = 'high';
       e.degradationPreference = degradationFor(state.quality);
@@ -183,6 +268,29 @@
     for (const s of pc.getSenders()) {
       if (s.track && s.track.kind === 'video') applySenderQuality(s);
     }
+  }
+
+  /* 讓傳輸優先採用 H.264：高幀率螢幕分享時硬體編碼器遠比 VP8／VP9 軟編穩定。
+   * 只重排偏好順序（完整清單仍在），不影響互通性；需在協商開始前設定。 */
+  function preferVideoCodecs(pc) {
+    try {
+      const caps = RTCRtpSender.getCapabilities('video');
+      if (!caps || !Array.isArray(caps.codecs) || caps.codecs.length === 0) return;
+      const rank = (c) => {
+        const m = (c.mimeType || '').toLowerCase();
+        if (m.includes('h264')) return 0;
+        if (m.includes('av1')) return 1;
+        if (m.includes('vp9')) return 2;
+        if (m.includes('vp8')) return 3;
+        return 4;
+      };
+      const ordered = [...caps.codecs].sort((a, b) => rank(a) - rank(b));
+      for (const t of pc.getTransceivers()) {
+        if (t.sender && t.sender.track && t.sender.track.kind === 'video') {
+          try { t.setCodecPreferences(ordered); } catch {}
+        }
+      }
+    } catch {}
   }
 
   /* ================= PeerJS 連線層 ================= */
@@ -309,6 +417,100 @@
         leaveRoomUI(true);
         break;
 
+      case 'chat': {
+        const p = state.participants.find((x) => x.id === fromPeerId);
+        const text = String(msg.text ?? '').slice(0, 2000);
+        if (text) {
+          appendChatText(fromPeerId, p ? p.name : '未知', msg.ts || Date.now(), text, false);
+          noteIncoming();
+        }
+        break;
+      }
+
+      case 'typing': {
+        const p = state.participants.find((x) => x.id === fromPeerId);
+        if (!p) break;
+        const cur = chat.typing.get(fromPeerId);
+        if (msg.on) {
+          if (cur) clearTimeout(cur.timer);
+          chat.typing.set(fromPeerId, {
+            name: p.name,
+            timer: setTimeout(() => { chat.typing.delete(fromPeerId); renderTyping(); }, 4000),
+          });
+        } else if (cur) {
+          clearTimeout(cur.timer);
+          chat.typing.delete(fromPeerId);
+        }
+        renderTyping();
+        break;
+      }
+
+      case 'file:start': {
+        if (chat.transfers.has(msg.fid)) break;
+        const fid = String(msg.fid || '');
+        const size = Number(msg.size) || 0;
+        if (!fid || size <= 0) break;
+        const p = state.participants.find((x) => x.id === fromPeerId);
+        if (size > FILE_MAX) {
+          toast(`「${String(msg.name || '檔案')}」超過 ${fmtBytes(FILE_MAX)} 上限，已拒收`, 'error');
+          sendTo(fromPeerId, { type: 'file:abort', fid });
+          break;
+        }
+        const t = registerTransfer({
+          fid,
+          name: String(msg.name || '未命名檔案').slice(0, 120),
+          size,
+          mime: String(msg.mime || 'application/octet-stream'),
+          ts: msg.ts || Date.now(),
+          dir: 'recv',
+        });
+        appendFileMsg(t, false, p ? p.name : '未知', fromPeerId);
+        noteIncoming();
+        break;
+      }
+
+      case 'file:chunk': {
+        const t = chat.transfers.get(String(msg.fid || ''));
+        if (!t || t.dir !== 'recv' || t.done || t.cancelled) break;
+        const seq = Number(msg.seq) | 0;
+        if (seq < 0 || seq > 200_000) break;
+        try {
+          const u8 = b64ToU8(String(msg.data || ''));
+          t.chunks[seq] = u8;
+          t.received += u8.byteLength;
+          updateTransferProgress(t);
+        } catch { /* 壞片直接略過，end 時會檢查完整性 */ }
+        break;
+      }
+
+      case 'file:end': {
+        const t = chat.transfers.get(String(msg.fid || ''));
+        if (!t || t.dir !== 'recv' || t.done) break;
+        const expected = Math.max(1, Math.ceil(t.size / FILE_CHUNK));
+        const got = t.chunks.filter(Boolean).length;
+        if (got !== expected) {
+          t.failed = true;
+          setTransferStatus(t, '傳輸不完整');
+        } else {
+          finalizeTransfer(t);
+        }
+        break;
+      }
+
+      case 'file:abort': {
+        const t = chat.transfers.get(String(msg.fid || ''));
+        if (!t || t.done) break;
+        if (t.dir === 'recv') {
+          t.cancelled = true;
+          t.chunks = [];
+          setTransferStatus(t, '對方已取消傳送');
+        } else {
+          // 收到拒收通知（例如對方拒收超限檔案）：中止自己的傳送迴圈
+          t.cancelled = true;
+        }
+        break;
+      }
+
       case 'hello': {
         const existing = state.participants.find((p) => p.id === fromPeerId);
         if (!existing) {
@@ -322,7 +524,10 @@
           });
           syncPeers(state.participants);
           renderRoom();
-          if (msg.name) toast(`${msg.name} 加入了房間`, 'success');
+          if (msg.name) {
+            toast(`${msg.name} 加入了房間`, 'success');
+            addSysMsg(`${msg.name} 加入了房間`);
+          }
         } else if (msg.name && existing.name !== msg.name) {
           existing.name = msg.name;
           renderRoom();
@@ -353,6 +558,9 @@
 
     if (p && state.room) {
       toast(`${p.name} 離開了房間`);
+      addSysMsg(`${p.name} 離開了房間`);
+      const tp = chat.typing.get(peerId);
+      if (tp) { clearTimeout(tp.timer); chat.typing.delete(peerId); renderTyping(); }
     }
 
     // 房主的連線斷了：可能是重新整理或短暫斷線，先自動重連，超過時限才判定關房
@@ -665,6 +873,8 @@
             renderRoom();
           }
         });
+        // removeTrack 後遠端軌會變 muted（不是 ended）：及時切回頭像，不留殘影
+        e.track.addEventListener('mute', () => renderRoom());
         e.track.addEventListener('unmute', () => renderRoom());
       } else if (stream.getVideoTracks().length === 0) {
         // 純語音流（螢幕分享的聲音跟著視訊流走，由 tile 的 <video> 播放）
@@ -690,6 +900,7 @@
       const sender = pc.addTrack(state.screenTrack, state.screenStream);
       applySenderQuality(sender);
     }
+    preferVideoCodecs(pc); // 需在 negotiationneeded 觸發前完成
 
     return peer;
   }
@@ -828,6 +1039,7 @@
     for (const [, peer] of state.peers) {
       const sender = peer.pc.addTrack(track, stream);
       await applySenderQuality(sender);
+      preferVideoCodecs(peer.pc);
     }
 
     emitState();
@@ -977,8 +1189,10 @@
     const badgeOwner = el('span', 'badge badge-owner hidden', '👑 房主');
     const topRight = el('div', 'tile-top-right');
     const statsEl = el('span', 'badge badge-stats hidden');
-    const fsBtn = el('button', 'btn-fs', '⛶');
+    const fsBtn = el('button', 'btn-fs');
+    fsBtn.appendChild(icon('maximize'));
     fsBtn.title = '全螢幕（或雙擊畫面）';
+    fsBtn.setAttribute('aria-label', '全螢幕');
     fsBtn.addEventListener('click', (e) => {
       e.stopPropagation();
       toggleFullscreen(root);
@@ -988,8 +1202,12 @@
 
     const bottom = el('div', 'tile-bottom');
     const nameRow = el('div', 'tile-namerow');
-    const badgeMic = el('span', 'tile-ico hidden', '🎤');
-    const badgeScreen = el('span', 'tile-ico hidden', '🖥️');
+    const badgeMic = el('span', 'tile-ico muted-ico hidden');
+    badgeMic.appendChild(icon('mic-off'));
+    badgeMic.title = '麥克風已靜音';
+    const badgeScreen = el('span', 'tile-ico screen-ico hidden');
+    badgeScreen.appendChild(icon('screen'));
+    badgeScreen.title = '正在分享螢幕';
     const nameEl = el('span', 'tile-name');
     nameRow.append(nameEl, badgeMic, badgeScreen);
     const stateEl = el('span', 'tile-state');
@@ -1014,10 +1232,10 @@
     $('#btn-settings').classList.toggle('hidden', !isOwner);
     $('#participant-count').textContent = `${state.participants.length} 人在房間`;
 
-    const ordered = [...state.participants].sort((a, b) => Number(b.screenOn) - Number(a.screenOn));
+    // 依加入順序原地更新磚塊；既有磚的 DOM 節點與視訊串流不動，不閃爍
     const seen = new Set();
 
-    for (const p of ordered) {
+    for (const p of state.participants) {
       seen.add(p.id);
       const tile = ensureTile(p);
       const isSelf = p.id === state.myId;
@@ -1029,7 +1247,8 @@
       tile.badgeScreen.classList.toggle('hidden', !p.screenOn);
 
       const stream = isSelf ? state.screenStream : (peer && peer.videoStream) || null;
-      const hasVideo = !!(stream && stream.getVideoTracks().some((tr) => tr.readyState === 'live'));
+      // muted 的軌道（對方已停止分享）不算有畫面，避免殘留最後一影格
+      const hasVideo = !!(stream && stream.getVideoTracks().some((tr) => tr.readyState === 'live' && !tr.muted));
 
       if (hasVideo) {
         if (tile.attached !== stream) {
@@ -1079,6 +1298,341 @@
     audioEls.clear();
   }
 
+  /* ================= 聊天：面板與訊息渲染 ================= */
+
+  function setChatOpen(open) {
+    const view = $('#view-room');
+    if (!view) return;
+    chat.open = !!open;
+    view.classList.toggle('chat-open', chat.open);
+    if (chat.open) {
+      chat.unread = 0;
+      updateUnreadBadge();
+      scrollChat(true);
+      if (window.innerWidth > 920) $('#chat-input').focus({ preventScroll: true });
+    }
+  }
+
+  function updateUnreadBadge() {
+    const b = $('#chat-unread');
+    if (!b) return;
+    b.textContent = chat.unread > 99 ? '99+' : String(chat.unread);
+    b.classList.toggle('hidden', chat.unread === 0);
+  }
+
+  function showJump() { const j = $('#chat-jump'); if (j) j.classList.remove('hidden'); }
+  function hideJump() { const j = $('#chat-jump'); if (j) j.classList.add('hidden'); }
+
+  function scrollChat(force) {
+    const box = $('#chat-messages');
+    if (!box) return;
+    if (force) {
+      box.scrollTop = box.scrollHeight;
+      chat.atBottom = true;
+      hideJump();
+      return;
+    }
+    if (chat.atBottom) box.scrollTop = box.scrollHeight;
+  }
+
+  function noteIncoming() {
+    if (!state.room) return;
+    if (!chat.open) {
+      chat.unread++;
+      updateUnreadBadge();
+    } else if (!chat.atBottom) {
+      showJump();
+    }
+    scrollChat(false);
+  }
+
+  /** 建立訊息列外框（頭像／名稱／時間，連續同人的訊息合併分組） */
+  function buildMsgScaffold(fromId, name, ts, isSelf) {
+    const box = $('#chat-messages');
+    const grouped = chat.lastSender === fromId && (ts - chat.lastGroupTs) < 180_000;
+    chat.lastSender = fromId;
+    chat.lastGroupTs = ts;
+
+    const root = el('div', 'msg ' + (isSelf ? 'me' : 'them') + (grouped ? ' grouped' : ''));
+    if (!isSelf && !grouped) {
+      const av = el('div', 'msg-avatar', (name || '?').charAt(0).toUpperCase());
+      av.style.setProperty('--h', nameHue(name));
+      root.appendChild(av);
+    }
+    const col = el('div', 'msg-col');
+    if (!grouped) {
+      const meta = el('div', 'msg-meta');
+      if (!isSelf) {
+        const nm = el('span', 'msg-name', name);
+        nm.style.color = `hsl(${nameHue(name)} 72% 74%)`;
+        meta.appendChild(nm);
+      }
+      meta.appendChild(el('span', 'msg-time', chatTime(ts)));
+      col.appendChild(meta);
+    }
+    const bubble = el('div', 'bubble');
+    col.appendChild(bubble);
+    root.appendChild(col);
+    box.appendChild(root);
+    return { root, col, bubble };
+  }
+
+  /** 純文字 + 自動連結（DOM 方式組裝，不吃 HTML） */
+  function appendTextWithLinks(node, text) {
+    const re = /(https?:\/\/[^\s<>"']+)/g;
+    let last = 0;
+    let m;
+    while ((m = re.exec(text))) {
+      if (m.index > last) node.appendChild(document.createTextNode(text.slice(last, m.index)));
+      const a = document.createElement('a');
+      a.href = m[0];
+      a.target = '_blank';
+      a.rel = 'noopener noreferrer';
+      a.textContent = m[0];
+      node.appendChild(a);
+      last = m.index + m[0].length;
+    }
+    if (last < text.length) node.appendChild(document.createTextNode(text.slice(last)));
+  }
+
+  function appendChatText(fromId, name, ts, text, isSelf) {
+    const s = buildMsgScaffold(fromId, name, ts, isSelf);
+    appendTextWithLinks(s.bubble, text);
+    scrollChat(isSelf);
+  }
+
+  function addSysMsg(text) {
+    const box = $('#chat-messages');
+    if (!box) return;
+    box.appendChild(el('div', 'msg-sys', text));
+    chat.lastSender = null; // 系統訊息切斷視覺分組
+    scrollChat(false);
+  }
+
+  /* ================= 聊天：送出文字／輸入中提示 ================= */
+
+  function sendChatText() {
+    const ta = $('#chat-input');
+    const text = ta.value.trim();
+    if (!text || !state.room) return;
+    if (!state.dataConns.size) toast('目前沒有其他成員，訊息只有自己看得到', 'info');
+    const ts = Date.now();
+    broadcast({ type: 'chat', mid: genId(), text, ts });
+    appendChatText(state.myId, state.nickname, ts, text, true);
+    ta.value = '';
+    autosizeChatInput();
+    $('#btn-chat-send').disabled = true;
+    stopTypingSignal();
+  }
+
+  function notifyTyping() {
+    if (!state.room || !state.dataConns.size) return;
+    if (!chat.typingSent) {
+      chat.typingSent = true;
+      broadcast({ type: 'typing', on: true });
+    }
+    chat.typingSentAt = Date.now();
+    clearTimeout(chat.typingOffTimer);
+    chat.typingOffTimer = setTimeout(stopTypingSignal, 2500);
+  }
+
+  function stopTypingSignal() {
+    clearTimeout(chat.typingOffTimer);
+    chat.typingOffTimer = null;
+    if (chat.typingSent) {
+      chat.typingSent = false;
+      if (state.room && state.dataConns.size) broadcast({ type: 'typing', on: false });
+    }
+  }
+
+  function renderTyping() {
+    const elx = $('#chat-typing');
+    if (!elx) return;
+    const names = [...chat.typing.values()].map((t) => t.name);
+    elx.textContent = names.length ? `${names.join('、')} 正在輸入…` : '';
+    elx.classList.toggle('hidden', !names.length);
+  }
+
+  function autosizeChatInput() {
+    const ta = $('#chat-input');
+    if (!ta) return;
+    ta.style.height = 'auto';
+    ta.style.height = Math.min(ta.scrollHeight, 132) + 'px';
+  }
+
+  /* ================= 聊天：檔案傳送 ================= */
+
+  function isImageMime(mime) {
+    return /^image\//.test(mime || '');
+  }
+
+  function registerTransfer(meta) {
+    const t = {
+      ...meta,
+      chunks: [],
+      received: 0,
+      cancelled: false,
+      failed: false,
+      done: false,
+      lastUi: 0,
+      blobUrl: null,
+      els: null,
+    };
+    chat.transfers.set(meta.fid, t);
+    return t;
+  }
+
+  function appendFileMsg(t, isSelf, fromName, fromId) {
+    const s = buildMsgScaffold(fromId, fromName, t.ts, isSelf);
+    const card = el('div', 'file-card');
+    const icoWrap = el('span', 'file-ico');
+    icoWrap.appendChild(icon(isImageMime(t.mime) ? 'image' : 'file'));
+    const main = el('div', 'file-main');
+    main.appendChild(el('div', 'file-name', t.name));
+    const bar = el('div', 'file-bar');
+    const barIn = el('div', 'file-bar-in');
+    bar.appendChild(barIn);
+    const sub = el('div', 'file-sub', isSelf ? '準備傳送…' : '接收中…');
+    main.append(bar, sub);
+    const action = el('span', 'file-action');
+    card.append(icoWrap, main, action);
+    s.bubble.appendChild(card);
+    t.els = { bubble: s.bubble, bar, barIn, sub, action };
+    scrollChat(isSelf);
+  }
+
+  function updateTransferProgress(t) {
+    if (!t.els || !t.size) return;
+    const pct = Math.min(100, Math.round((t.received / t.size) * 100));
+    const now = Date.now();
+    if (pct < 100 && now - t.lastUi < 90) return; // 節流，避免高頻改 DOM
+    t.lastUi = now;
+    t.els.barIn.style.width = pct + '%';
+    t.els.sub.textContent = `${fmtBytes(t.received)} / ${fmtBytes(t.size)}（${pct}%）`;
+  }
+
+  function setTransferStatus(t, text, bad = true) {
+    if (!t.els) return;
+    t.els.bar.classList.add('off');
+    t.els.sub.textContent = text;
+    t.els.sub.style.color = bad ? 'var(--red)' : '';
+  }
+
+  function finalizeTransfer(t, prebuiltBlob) {
+    t.done = true;
+    let blob;
+    try {
+      blob = prebuiltBlob || new Blob(t.chunks, { type: t.mime || 'application/octet-stream' });
+    } catch {
+      t.failed = true;
+      setTransferStatus(t, '組合檔案失敗');
+      return;
+    }
+    t.chunks = [];
+    try { t.blobUrl = URL.createObjectURL(blob); } catch { t.blobUrl = null; }
+    if (t.blobUrl) chat.urls.push(t.blobUrl);
+    if (!t.els) return;
+    t.els.bar.classList.add('done');
+    t.els.sub.textContent = fmtBytes(t.size);
+    t.els.sub.style.color = '';
+    if (t.blobUrl) {
+      const a = document.createElement('a');
+      a.className = 'file-dl';
+      a.href = t.blobUrl;
+      a.download = t.name;
+      a.appendChild(icon('download'));
+      a.appendChild(document.createTextNode('下載'));
+      t.els.action.appendChild(a);
+      if (isImageMime(t.mime) && t.size <= 25 * 1024 * 1024) {
+        const img = document.createElement('img');
+        img.className = 'msg-img';
+        img.alt = t.name;
+        img.src = t.blobUrl;
+        img.loading = 'lazy';
+        img.addEventListener('click', () => window.open(t.blobUrl, '_blank'));
+        t.els.bubble.insertBefore(img, t.els.bubble.firstChild);
+      }
+    }
+  }
+
+  function enqueueFiles(files) {
+    if (!state.room || !files || !files.length) return;
+    let queued = 0;
+    for (const f of files) {
+      if (!f) continue;
+      if (f.size > FILE_MAX) {
+        toast(`「${f.name}」超過 ${fmtBytes(FILE_MAX)} 單檔上限，已略過`, 'error');
+        continue;
+      }
+      fileQueue.push(f);
+      queued++;
+    }
+    if (queued && !state.dataConns.size) toast('目前沒有其他成員，檔案不會傳給任何人', 'info');
+    if (fileQueue.length && !fileSending) runFileQueue();
+  }
+
+  async function runFileQueue() {
+    fileSending = true;
+    while (fileQueue.length) {
+      const f = fileQueue.shift();
+      try {
+        await sendFile(f);
+      } catch (err) {
+        console.warn('sendFile failed:', err);
+      }
+    }
+    fileSending = false;
+  }
+
+  async function sendFile(file) {
+    if (!state.room || !state.dataConns.size) return;
+    const fid = genId();
+    const t = registerTransfer({
+      fid,
+      fromId: state.myId,
+      name: file.name || '未命名檔案',
+      size: file.size,
+      mime: file.type || 'application/octet-stream',
+      ts: Date.now(),
+      dir: 'send',
+    });
+    appendFileMsg(t, true, state.nickname, state.myId);
+    broadcast({ type: 'file:start', fid, name: t.name, size: t.size, mime: t.mime, ts: t.ts });
+
+    try {
+      let seq = 0;
+      let offset = 0;
+      while (offset < t.size) {
+        if (t.cancelled) throw Object.assign(new Error('cancelled'), { silent: true });
+        const buf = await file.slice(offset, offset + FILE_CHUNK).arrayBuffer();
+        if (t.cancelled) throw Object.assign(new Error('cancelled'), { silent: true });
+        broadcast({ type: 'file:chunk', fid, seq, data: u8ToB64(new Uint8Array(buf)) });
+        offset += buf.byteLength;
+        seq++;
+        t.received = offset;
+        updateTransferProgress(t);
+        // 背壓控制：任一連線緩衝超過水位就稍等，避免塞爆 SCTP 緩衝
+        let guard = 0;
+        while (maxBuffered() > FILE_BUFFER_HIGH) {
+          await sleep(25);
+          if (t.cancelled) throw Object.assign(new Error('cancelled'), { silent: true });
+          if (++guard > 800) throw new Error('傳送停滯（對方長時間未接收）');
+        }
+      }
+      broadcast({ type: 'file:end', fid });
+      finalizeTransfer(t, file);
+    } catch (err) {
+      broadcast({ type: 'file:abort', fid });
+      t.cancelled = true;
+      if (t.els) {
+        t.els.bar.classList.add('off');
+        t.els.sub.textContent = err && err.silent ? '已取消' : '傳送失敗';
+        t.els.sub.style.color = err && err.silent ? '' : 'var(--red)';
+      }
+      if (!err || !err.silent) toast(`「${t.name}」傳送失敗：${(err && err.message) || '未知錯誤'}`, 'error');
+    }
+  }
+
   /* ================= 控制列 ================= */
 
   function emitState() {
@@ -1092,17 +1646,20 @@
 
   function updateControlBar() {
     const mic = $('#btn-mic');
-    mic.textContent = state.micStream ? '🎤 關閉麥克風' : '🎤 開啟麥克風';
     mic.classList.toggle('active', !!state.micStream);
+    mic.title = state.micStream ? '關閉麥克風' : '開啟麥克風';
+    mic.querySelector('.ctl-label').textContent = state.micStream ? '關閉麥克風' : '開啟麥克風';
 
     const mute = $('#btn-mute');
     mute.disabled = !state.micStream;
-    mute.textContent = state.micMuted ? '🔇 取消靜音' : '🔇 靜音';
     mute.classList.toggle('active', state.micMuted);
+    mute.title = state.micMuted ? '取消靜音' : '靜音';
+    mute.querySelector('.ctl-label').textContent = state.micMuted ? '取消靜音' : '靜音';
 
     const screen = $('#btn-screen');
-    screen.textContent = state.screenStream ? '🖥️ 停止分享' : '🖥️ 分享螢幕';
     screen.classList.toggle('active', !!state.screenStream);
+    screen.title = state.screenStream ? '停止分享' : '分享螢幕';
+    screen.querySelector('.ctl-label').textContent = state.screenStream ? '停止分享' : '分享螢幕';
   }
 
   /* ================= 進出房間 ================= */
@@ -1117,6 +1674,12 @@
     renderRoom();
     updateControlBar();
     startStats();
+    if (!chat.welcomed) {
+      chat.welcomed = true;
+      addSysMsg('歡迎使用聊天室：訊息與檔案在成員之間點對點直傳，不經過伺服器');
+    }
+    // 寬螢幕預設展開聊天欄，窄螢幕收起（可隨時用下方「聊天」切換）
+    if (window.innerWidth >= 1100) setChatOpen(true);
   }
 
   async function leaveRoomUI(silent = false) {
@@ -1128,6 +1691,27 @@
     await stopScreenShare();
     closeAllPeers();
     clearTiles();
+
+    // 清理聊天／檔案傳送狀態
+    fileQueue.length = 0;
+    fileSending = false;
+    for (const [, t] of chat.transfers) { t.cancelled = true; }
+    chat.transfers.clear();
+    for (const u of chat.urls) { try { URL.revokeObjectURL(u); } catch {} }
+    chat.urls = [];
+    for (const [, tp] of chat.typing) clearTimeout(tp.timer);
+    chat.typing.clear();
+    clearTimeout(chat.typingOffTimer);
+    chat.typingSent = false;
+    chat.unread = 0;
+    chat.lastSender = null;
+    chat.atBottom = true;
+    chat.welcomed = false;
+    renderTyping();
+    updateUnreadBadge();
+    const box = $('#chat-messages');
+    if (box) box.textContent = '';
+    setChatOpen(false);
 
     // 關閉所有 data connections
     for (const [, conn] of state.dataConns) {
@@ -1283,6 +1867,7 @@
         broadcast({ type: 'participants', participants: state.participants });
         // 房主主動與新成員建立媒體連線：中途加入者立刻收到目前的麥克風／螢幕分享
         syncPeers(state.participants);
+        renderRoom(); // 原地更新人數與名單，頁面不重新載入
         toast(`${msg.nickname} 加入了房間`, 'success');
       });
 
@@ -1427,6 +2012,64 @@
     // 注意：這裡刻意不做 beforeunload 關房 —— 房主「重新整理」不算退出房間，
     // 房間要靠本機狀態＋成員端自動重連延續；只有房主主動按「離開」才關房。
 
+    /* ---------- 聊天 ---------- */
+    $('#btn-chat').addEventListener('click', () => setChatOpen(!chat.open));
+    $('#btn-chat-close').addEventListener('click', () => setChatOpen(false));
+    $('#chat-scrim').addEventListener('click', () => setChatOpen(false));
+    $('#chat-jump').addEventListener('click', () => { hideJump(); scrollChat(true); });
+    $('#btn-chat-send').addEventListener('click', sendChatText);
+    $('#btn-chat-attach').addEventListener('click', () => $('#chat-file-input').click());
+    $('#chat-file-input').addEventListener('change', (e) => {
+      const files = [...(e.target.files || [])];
+      e.target.value = '';
+      enqueueFiles(files);
+    });
+
+    const chatInput = $('#chat-input');
+    chatInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        sendChatText();
+      }
+    });
+    chatInput.addEventListener('input', () => {
+      autosizeChatInput();
+      $('#btn-chat-send').disabled = !chatInput.value.trim();
+      notifyTyping();
+    });
+    // 直接貼上截圖／圖片即可傳送
+    chatInput.addEventListener('paste', (e) => {
+      const files = [...(e.clipboardData?.files || [])];
+      if (files.length) {
+        e.preventDefault();
+        enqueueFiles(files);
+      }
+    });
+
+    // 拖放檔案到聊天欄即可傳送
+    const panel = $('#chat-panel');
+    ['dragenter', 'dragover'].forEach((ev) =>
+      panel.addEventListener(ev, (e) => { e.preventDefault(); panel.classList.add('dragging'); })
+    );
+    ['dragleave', 'drop'].forEach((ev) =>
+      panel.addEventListener(ev, (e) => {
+        e.preventDefault();
+        if (ev === 'drop') {
+          const files = [...(e.dataTransfer?.files || [])];
+          if (files.length) enqueueFiles(files);
+        } else if (e.relatedTarget && panel.contains(e.relatedTarget)) {
+          return; // 还在面板内部移动，不取消提示
+        }
+        panel.classList.remove('dragging');
+      })
+    );
+
+    const msgBox = $('#chat-messages');
+    msgBox.addEventListener('scroll', () => {
+      chat.atBottom = msgBox.scrollHeight - msgBox.scrollTop - msgBox.clientHeight < 60;
+      if (chat.atBottom) hideJump();
+    });
+
     if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) {
       const btn = $('#btn-screen');
       btn.disabled = true;
@@ -1459,15 +2102,7 @@
 
   async function boot() {
     bindUI();
-
-    // 靜態版無房間列表，改為提示
-    const box = $('#room-list');
-    if (box) {
-      box.textContent = '';
-      box.appendChild(
-        el('p', 'muted', '靜態版無法顯示房間列表。請直接輸入房間碼加入，或建立新房間。')
-      );
-    }
+    setBadge('就緒', 'on');
 
     const hostState = readStored(HOST_STATE_KEY);
     const clientState = readStored(CLIENT_STATE_KEY);

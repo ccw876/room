@@ -2,108 +2,174 @@
 <html lang="zh-Hant">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="description" content="私密語音／螢幕分享房間：房間碼＋密碼加入，WebRTC 點對點加密">
-  <title>Room — 私密語音・螢幕分享房間</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#0a0c10">
+  <meta name="description" content="私密語音／螢幕分享房間：房間碼＋密碼加入，WebRTC 點對點加密，支援文字聊天與檔案傳送">
+  <title>Room — 私密語音・螢幕分享・文字聊天</title>
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🏠</text></svg>">
   <link rel="stylesheet" href="./css/style.css">
 </head>
 <body>
 
+  <!-- SVG 圖示（feather 風格描邊，跟隨 currentColor） -->
+  <svg xmlns="http://www.w3.org/2000/svg" style="display:none" aria-hidden="true">
+    <symbol id="i-home" viewBox="0 0 24 24"><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></symbol>
+    <symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><polyline points="9 11.5 11.2 13.7 15.5 9.5"/></symbol>
+    <symbol id="i-zap" viewBox="0 0 24 24"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></symbol>
+    <symbol id="i-chat" viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></symbol>
+    <symbol id="i-mic" viewBox="0 0 24 24"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/></symbol>
+    <symbol id="i-mic-off" viewBox="0 0 24 24"><line x1="1" y1="1" x2="23" y2="23"/><path d="M9 9v3a3 3 0 0 0 5.12 2.12M15 9.34V4a3 3 0 0 0-5.94-.6"/><path d="M17 16.95A7 7 0 0 1 5 12v-2m14 0v2a7 7 0 0 1-.11 1.23"/><line x1="12" y1="19" x2="12" y2="23"/></symbol>
+    <symbol id="i-screen" viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="14" rx="2" ry="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></symbol>
+    <symbol id="i-leave" viewBox="0 0 24 24"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></symbol>
+    <symbol id="i-settings" viewBox="0 0 24 24"><line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/></symbol>
+    <symbol id="i-copy" viewBox="0 0 24 24"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></symbol>
+    <symbol id="i-users" viewBox="0 0 24 24"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></symbol>
+    <symbol id="i-clip" viewBox="0 0 24 24"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></symbol>
+    <symbol id="i-send" viewBox="0 0 24 24"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></symbol>
+    <symbol id="i-download" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></symbol>
+    <symbol id="i-x" viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></symbol>
+    <symbol id="i-file" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></symbol>
+    <symbol id="i-image" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></symbol>
+    <symbol id="i-maximize" viewBox="0 0 24 24"><path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3"/></symbol>
+    <symbol id="i-arrow-down" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><polyline points="19 12 12 19 5 12"/></symbol>
+    <symbol id="i-plus" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></symbol>
+    <symbol id="i-login" viewBox="0 0 24 24"><path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/><polyline points="10 17 15 12 10 7"/><line x1="15" y1="12" x2="3" y2="12"/></symbol>
+  </svg>
+
   <!-- ================= 大廳 ================= -->
   <div id="view-lobby" class="view">
     <header class="lobby-header">
-      <h1>🏠 Room</h1>
-      <p class="muted">建立私密房間，用「房間碼＋密碼」邀請朋友，麥克風交談、螢幕共享（1080p・最高 120fps）。</p>
+      <div class="brand">
+        <span class="brand-mark"><svg class="ico"><use href="#i-home"/></svg></span>
+        <h1>Room</h1>
+      </div>
+      <p class="muted">建立或加入私密房間：語音交談、螢幕共享、文字聊天與檔案傳送，點對點加密。</p>
+      <div class="feature-row">
+        <span class="chip"><svg class="ico"><use href="#i-shield"/></svg>點對點加密</span>
+        <span class="chip"><svg class="ico"><use href="#i-zap"/></svg>1080p／120fps</span>
+        <span class="chip"><svg class="ico"><use href="#i-chat"/></svg>聊天＋檔案</span>
+      </div>
     </header>
 
     <div class="nickname-row">
-      <label for="nickname">你的暱稱</label>
+      <label for="nickname">暱稱</label>
       <input id="nickname" maxlength="20" placeholder="例如：小明" autocomplete="nickname">
     </div>
 
     <main class="cards">
       <section class="card">
-        <h2>✨ 創建房間</h2>
+        <div class="card-head">
+          <span class="card-ico"><svg class="ico"><use href="#i-plus"/></svg></span>
+          <h2>建立房間</h2>
+        </div>
         <label for="create-name">房間名稱</label>
         <input id="create-name" maxlength="40" placeholder="例如：週末遊戲團" autocomplete="off">
-        <label for="create-password">房間密碼（你自己設定）</label>
+        <label for="create-password">密碼</label>
         <input id="create-password" type="password" maxlength="64" placeholder="至少 4 字" autocomplete="new-password">
-        <button id="btn-create" class="primary">建房間（我是房主）</button>
-        <p class="muted small">建立後會產生一組 6 位房間碼，把它和密碼告訴朋友。</p>
+        <button id="btn-create" class="primary">建立房間</button>
+        <p class="muted small">建立後產生 6 位房間碼，連同密碼分享給朋友。</p>
       </section>
 
       <section class="card">
-        <h2>🚪 加入房間</h2>
+        <div class="card-head">
+          <span class="card-ico"><svg class="ico"><use href="#i-login"/></svg></span>
+          <h2>加入房間</h2>
+        </div>
         <label for="join-code">房間碼</label>
-        <input id="join-code" maxlength="6" placeholder="6 位英文數字" autocomplete="off" class="code-input">
-        <label for="join-password">房間密碼</label>
+        <input id="join-code" maxlength="6" placeholder="6 位英數" autocomplete="off" class="code-input">
+        <label for="join-password">密碼</label>
         <input id="join-password" type="password" maxlength="64" placeholder="房主設定的密碼" autocomplete="current-password">
         <button id="btn-join" class="primary">加入房間</button>
-        <p class="muted small">需要房間碼<strong>和</strong>密碼兩者都正確才能進入。</p>
+        <p class="muted small">房間碼與密碼都正確才能進入。</p>
       </section>
     </main>
 
-    <section class="room-list-section">
-      <h2>目前開放的房間</h2>
-      <div id="room-list"><p class="muted">載入中…</p></div>
-    </section>
+    <footer class="lobby-foot muted small">語音與畫面全程 WebRTC 點對點傳輸，不經過伺服器；聊天訊息與檔案也只在成員之間直接傳送。</footer>
   </div>
 
   <!-- ================= 房間 ================= -->
   <div id="view-room" class="view hidden">
     <header class="room-header">
       <div class="rh-left">
-        <button id="btn-leave" class="ghost">← 離開</button>
-        <div>
+        <button id="btn-leave" class="ctl-icon danger" title="離開房間" aria-label="離開房間"><svg class="ico"><use href="#i-leave"/></svg></button>
+        <div class="rh-title">
           <div class="room-title-line">
             <span id="room-name" class="room-name"></span>
-            <span id="owner-badge" class="badge badge-owner hidden">👑 你是房主</span>
+            <span id="owner-badge" class="badge badge-owner hidden">房主</span>
           </div>
           <div class="room-sub">
-            房間碼 <code id="room-code"></code>
+            <code id="room-code"></code>
             <button id="btn-copy-code" class="linkish">複製</button>
             <span class="dot">·</span>
             <span id="participant-count"></span>
           </div>
         </div>
       </div>
-      <button id="btn-settings" class="ghost hidden">⚙️ 房間設定</button>
+      <div class="rh-right">
+        <button id="btn-settings" class="ctl-icon ghost hidden" title="房間設定" aria-label="房間設定"><svg class="ico"><use href="#i-settings"/></svg></button>
+      </div>
     </header>
 
-    <div class="controls">
-      <button id="btn-mic" class="ctl">🎤 開啟麥克風</button>
-      <button id="btn-mute" class="ctl" disabled>🔇 靜音</button>
-      <span class="sep"></span>
+    <div class="room-body">
+      <div class="stage">
+        <p class="hint">角標顯示實際解析度與幀率。Safari 螢幕擷取上限約 30fps，建議用 Chrome 分享。雙擊畫面可全螢幕。</p>
+        <main id="tiles" class="tiles"></main>
+      </div>
+
+      <!-- 文字聊天側欄 -->
+      <aside id="chat-panel" class="chat-panel" aria-label="文字聊天">
+        <header class="chat-head">
+          <span class="chat-head-ico"><svg class="ico"><use href="#i-chat"/></svg></span>
+          <span class="chat-head-title">聊天</span>
+          <span id="chat-typing" class="chat-typing hidden"></span>
+          <button id="btn-chat-close" class="ctl-icon ghost" title="收起聊天" aria-label="收起聊天"><svg class="ico"><use href="#i-x"/></svg></button>
+        </header>
+        <div id="chat-messages" class="chat-messages"></div>
+        <button id="chat-jump" class="chat-jump hidden"><svg class="ico"><use href="#i-arrow-down"/></svg>新訊息</button>
+        <div class="chat-inputbar">
+          <input type="file" id="chat-file-input" multiple hidden>
+          <button id="btn-chat-attach" class="ctl-icon ghost" title="傳送檔案" aria-label="傳送檔案"><svg class="ico"><use href="#i-clip"/></svg></button>
+          <textarea id="chat-input" rows="1" placeholder="輸入訊息…" maxlength="2000"></textarea>
+          <button id="btn-chat-send" class="send-btn" title="送出（Enter）" aria-label="送出訊息" disabled><svg class="ico"><use href="#i-send"/></svg></button>
+        </div>
+        <p class="chat-hint muted">Enter 送出・Shift+Enter 換行・可貼上或拖入圖片／檔案</p>
+      </aside>
+    </div>
+
+    <div id="chat-scrim"></div>
+
+    <!-- 底部控制坞 -->
+    <div class="dock">
+      <button id="btn-mic" class="dock-btn" title="開啟麥克風"><svg class="ico"><use href="#i-mic"/></svg><span class="ctl-label">開啟麥克風</span></button>
+      <button id="btn-mute" class="dock-btn" title="靜音" disabled><svg class="ico"><use href="#i-mic-off"/></svg><span class="ctl-label">靜音</span></button>
+      <span class="dock-sep"></span>
       <div class="quality">
-        <label for="quality">分享畫質</label>
-        <select id="quality">
-          <option value="ultra">1080p・最高 120fps（頂級流暢）</option>
-          <option value="text">1080p・60fps（文字清晰）</option>
-          <option value="saver">720p・30fps（省頻寬）</option>
+        <select id="quality" aria-label="分享畫質">
+          <option value="ultra">1080p・120fps</option>
+          <option value="text">1080p・60fps</option>
+          <option value="saver">720p・30fps</option>
         </select>
       </div>
-      <button id="btn-screen" class="ctl">🖥️ 分享螢幕</button>
+      <button id="btn-screen" class="dock-btn" title="分享螢幕"><svg class="ico"><use href="#i-screen"/></svg><span class="ctl-label">分享螢幕</span></button>
+      <span class="dock-sep"></span>
+      <button id="btn-chat" class="dock-btn" title="聊天"><svg class="ico"><use href="#i-chat"/></svg><span class="ctl-label">聊天</span><span id="chat-unread" class="unread hidden"></span></button>
     </div>
-    <p class="hint" id="quality-hint">
-      系統會向瀏覽器要求 1920×1080／120fps；角標顯示<strong>實際量測</strong>的解析度與幀率。
-      實際幀率由瀏覽器擷取管線決定：<strong>Safari（macOS）螢幕擷取上限約 30fps</strong>；
-      Chrome／Edge 通常 60fps；更高幀率需要高更新率螢幕與支援的擷取環境（建議用 Chrome 分享）。
-    </p>
 
-    <main id="tiles" class="tiles"></main>
     <div id="audios" class="hidden"></div>
   </div>
 
   <!-- ================= 房主設定彈窗 ================= -->
   <div id="modal-settings" class="modal hidden">
     <div class="modal-card">
-      <h2>⚙️ 房間設定（限房主）</h2>
+      <div class="modal-head">
+        <span class="card-ico"><svg class="ico"><use href="#i-settings"/></svg></span>
+        <h2>房間設定</h2>
+      </div>
       <label for="set-name">房間名稱</label>
       <input id="set-name" maxlength="40" autocomplete="off">
       <label for="set-password">新密碼</label>
-      <input id="set-password" type="password" maxlength="64" placeholder="留空表示不修改密碼" autocomplete="new-password">
-      <p class="muted small">修改後新加入者需使用新密碼；房間碼不會改變，正在房內的人不受影響。</p>
+      <input id="set-password" type="password" maxlength="64" placeholder="留空表示不修改" autocomplete="new-password">
+      <p class="muted small">修改後新加入者需使用新密碼；房間碼不變，房內成員不受影響。</p>
       <div class="modal-actions">
         <button id="btn-settings-cancel" class="ghost">取消</button>
         <button id="btn-settings-save" class="primary">儲存</button>
