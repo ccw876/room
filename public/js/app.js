@@ -51,6 +51,7 @@
     micMuted: false,
     screenStream: null,
     screenTrack: null,
+    screenAudioTrack: null,
     quality: 'ultra',
     statsTimer: null,
     updatingRoom: false,
@@ -240,10 +241,6 @@
     return q === 'ultra' ? 24_000_000 : q === 'text' ? 12_000_000 : 3_500_000;
   }
 
-  function maxFpsFor(q) {
-    return q === 'ultra' ? 120 : q === 'text' ? 60 : 30;
-  }
-
   function degradationFor(q) {
     if (q === 'text') return 'maintain-resolution';
     if (q === 'saver') return 'balanced';
@@ -256,7 +253,8 @@
       if (!Array.isArray(p.encodings) || p.encodings.length === 0) p.encodings = [{}];
       const e = p.encodings[0];
       e.maxBitrate = bitrateFor(state.quality);
-      e.maxFramerate = maxFpsFor(state.quality);
+      // 刻意不設 encodings.maxFramerate：擷取端 constraints 已限制幀率；
+      // Chrome 在 replaceTrack 後沿用這個參數會把編碼幀率壓低（第二次分享變卡的元兇）
       e.scaleResolutionDownBy = 1; // 禁止瀏覽器自動降解析度，保住 1080p
       e.networkPriority = 'high';
       e.priority = 'high';
@@ -882,9 +880,15 @@
           e.track.addEventListener('mute', () => renderRoom());
           e.track.addEventListener('unmute', () => renderRoom());
         }
-      } else if (stream.getVideoTracks().length === 0) {
-        // 純語音流（螢幕分享的聲音跟著視訊流走，由 tile 的 <video> 播放）
-        attachRemoteAudio(peerId, stream);
+      } else if (e.track.kind === 'audio') {
+        if (stream.getVideoTracks().length === 0) {
+          // 純語音流（麥克風）
+          attachRemoteAudio(peerId, stream);
+        } else {
+          // 螢幕分享的系統／分頁聲音：跟視訊掛同一條 stream，用獨立 <audio> 播放；
+          // 以 track.id 為 key，replaceTrack 重用同一條 m-line 時不會重複建元素
+          attachRemoteAudio(peerId, new MediaStream([e.track]), 'sa:' + e.track.id);
+        }
       }
       renderRoom();
     };
@@ -906,6 +910,9 @@
       const sender = pc.addTrack(state.screenTrack, state.screenStream);
       peer.videoSender = sender;
       applySenderQuality(sender);
+      if (state.screenAudioTrack) {
+        peer.screenAudioSender = pc.addTrack(state.screenAudioTrack, state.screenStream);
+      }
     }
     preferVideoCodecs(pc); // 需在 negotiationneeded 觸發前完成
 
@@ -939,9 +946,9 @@
     }
   }
 
-  function attachRemoteAudio(peerId, stream) {
+  function attachRemoteAudio(peerId, stream, keyOverride) {
     if (stream.getVideoTracks().length > 0) return;
-    const key = `${peerId}:${stream.id}`;
+    const key = keyOverride || `${peerId}:${stream.id}`;
     if (audioEls.has(key)) return;
     const a = document.createElement('audio');
     a.autoplay = true;
@@ -1040,6 +1047,7 @@
 
     state.screenStream = stream;
     state.screenTrack = track;
+    state.screenAudioTrack = stream.getAudioTracks()[0] || null;
     track.contentHint = state.quality === 'text' ? 'detail' : 'motion';
     track.addEventListener('ended', () => stopScreenShare());
 
@@ -1059,6 +1067,19 @@
         const sender = peer.pc.addTrack(track, stream);
         peer.videoSender = sender;
       }
+      // 螢幕分享的系統／分頁聲音：跟視訊走同一條 stream（各自的 m-line）
+      if (state.screenAudioTrack) {
+        if (peer.screenAudioSender) {
+          try {
+            await peer.screenAudioSender.replaceTrack(state.screenAudioTrack);
+          } catch {
+            peer.screenAudioSender = null;
+          }
+        }
+        if (!peer.screenAudioSender) {
+          peer.screenAudioSender = peer.pc.addTrack(state.screenAudioTrack, stream);
+        }
+      }
       await applySenderQuality(peer.videoSender);
       preferVideoCodecs(peer.pc);
     }
@@ -1071,6 +1092,9 @@
     const fps = s.frameRate ? Math.round(s.frameRate) : null;
     toast(
       `開始分享（擷取 ${s.width || '?'}x${s.height || '?'} @ ${fps ?? '—'}fps）` +
+        `\n🔊 ${state.screenAudioTrack
+          ? '已分享聲音'
+          : '未分享聲音（在 Chrome 的分享視窗勾選「同時分享音訊」即可）'}` +
         (state.quality === 'ultra' && fps !== null && fps < 120 ? '\n⚠️ 目前低於 120fps 目標' : ''),
       fps !== null && fps < 120 ? 'info' : 'success'
     );
@@ -1081,6 +1105,7 @@
     if (!stream) return;
     state.screenStream = null;
     state.screenTrack = null;
+    state.screenAudioTrack = null;
     stream.getTracks().forEach((t) => t.stop());
     // replaceTrack(null) 不觸發重新協商：m-line 留著、編碼器參數不動，
     // 下次分享 replaceTrack 新軌即可；這是「第二次投屏變卡」的根本修法
@@ -1088,13 +1113,21 @@
       if (peer.videoSender) {
         try {
           await peer.videoSender.replaceTrack(null);
-          continue;
-        } catch { /* sender 已失效時退回 removeTrack */ }
-        try { peer.pc.removeTrack(peer.videoSender); } catch {}
-        peer.videoSender = null;
+        } catch {
+          try { peer.pc.removeTrack(peer.videoSender); } catch {}
+          peer.videoSender = null;
+        }
       } else {
         const sender = peer.pc.getSenders().find((s) => s.track && s.track.kind === 'video');
         if (sender) { try { peer.pc.removeTrack(sender); } catch {} }
+      }
+      if (peer.screenAudioSender) {
+        try {
+          await peer.screenAudioSender.replaceTrack(null);
+        } catch {
+          try { peer.pc.removeTrack(peer.screenAudioSender); } catch {}
+          peer.screenAudioSender = null;
+        }
       }
     }
     emitState();
