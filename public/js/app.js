@@ -63,6 +63,9 @@
 
   const tileEls = new Map();
   const audioEls = new Map();
+  // 遠端軌道只掛一次事件：重新協商／replaceTrack 會讓同一個 track 反覆觸發 ontrack，
+  // 用 WeakSet 去重，避免 mute/unmute 監聽器隨投屏次數累積（越用越卡的元兇之一）
+  const seenRemoteTracks = new WeakSet();
 
   /* ================= 文字聊天／檔案傳送 ================= */
   // 聊天與檔案都走既有的 P2P DataConnection（mesh：每對成員之間一條直連通道），
@@ -867,15 +870,18 @@
       if (!stream) return;
       if (e.track.kind === 'video') {
         peer.videoStream = stream;
-        e.track.addEventListener('ended', () => {
-          if (peer.videoStream === stream) {
-            peer.videoStream = null;
-            renderRoom();
-          }
-        });
-        // removeTrack 後遠端軌會變 muted（不是 ended）：及時切回頭像，不留殘影
-        e.track.addEventListener('mute', () => renderRoom());
-        e.track.addEventListener('unmute', () => renderRoom());
+        if (!seenRemoteTracks.has(e.track)) {
+          seenRemoteTracks.add(e.track);
+          e.track.addEventListener('ended', () => {
+            if (peer.videoStream === stream) {
+              peer.videoStream = null;
+              renderRoom();
+            }
+          });
+          // 對方停止分享後遠端軌會變 muted（不是 ended）：及時切回頭像，不留殘影
+          e.track.addEventListener('mute', () => renderRoom());
+          e.track.addEventListener('unmute', () => renderRoom());
+        }
       } else if (stream.getVideoTracks().length === 0) {
         // 純語音流（螢幕分享的聲音跟著視訊流走，由 tile 的 <video> 播放）
         attachRemoteAudio(peerId, stream);
@@ -898,6 +904,7 @@
     if (state.micTrack && state.micStream) pc.addTrack(state.micTrack, state.micStream);
     if (state.screenTrack && state.screenStream) {
       const sender = pc.addTrack(state.screenTrack, state.screenStream);
+      peer.videoSender = sender;
       applySenderQuality(sender);
     }
     preferVideoCodecs(pc); // 需在 negotiationneeded 觸發前完成
@@ -1037,8 +1044,22 @@
     track.addEventListener('ended', () => stopScreenShare());
 
     for (const [, peer] of state.peers) {
-      const sender = peer.pc.addTrack(track, stream);
-      await applySenderQuality(sender);
+      // 優先 replaceTrack：第二次起的分享完全不觸發重新協商，
+      // m-line 與編碼器設定保持原狀，避免重複協商造成的效能劣化
+      let reused = false;
+      if (peer.videoSender) {
+        try {
+          await peer.videoSender.replaceTrack(track);
+          reused = true;
+        } catch {
+          peer.videoSender = null;
+        }
+      }
+      if (!reused) {
+        const sender = peer.pc.addTrack(track, stream);
+        peer.videoSender = sender;
+      }
+      await applySenderQuality(peer.videoSender);
       preferVideoCodecs(peer.pc);
     }
 
@@ -1061,10 +1082,19 @@
     state.screenStream = null;
     state.screenTrack = null;
     stream.getTracks().forEach((t) => t.stop());
+    // replaceTrack(null) 不觸發重新協商：m-line 留著、編碼器參數不動，
+    // 下次分享 replaceTrack 新軌即可；這是「第二次投屏變卡」的根本修法
     for (const [, peer] of state.peers) {
-      const sender = peer.pc.getSenders().find((s) => s.track && s.track.kind === 'video');
-      if (sender) {
-        try { peer.pc.removeTrack(sender); } catch {}
+      if (peer.videoSender) {
+        try {
+          await peer.videoSender.replaceTrack(null);
+          continue;
+        } catch { /* sender 已失效時退回 removeTrack */ }
+        try { peer.pc.removeTrack(peer.videoSender); } catch {}
+        peer.videoSender = null;
+      } else {
+        const sender = peer.pc.getSenders().find((s) => s.track && s.track.kind === 'video');
+        if (sender) { try { peer.pc.removeTrack(sender); } catch {} }
       }
     }
     emitState();
@@ -2069,6 +2099,18 @@
       chat.atBottom = msgBox.scrollHeight - msgBox.scrollTop - msgBox.clientHeight < 60;
       if (chat.atBottom) hideJump();
     });
+
+    // 從最小化／背景分頁回到前景：恢復影片播放、立即刷新統計，
+    // 消除「最小化回來後畫面卡住／角標停更」的問題
+    const resumeMedia = () => {
+      if (document.visibilityState !== 'visible' || !state.room) return;
+      for (const [, tile] of tileEls) {
+        if (tile.attached && tile.video.paused) tile.video.play().catch(() => {});
+      }
+      pollStats();
+    };
+    document.addEventListener('visibilitychange', resumeMedia);
+    window.addEventListener('focus', resumeMedia);
 
     if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) {
       const btn = $('#btn-screen');
