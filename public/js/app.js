@@ -1,5 +1,11 @@
 /* Room — 私密語音・螢幕分享房間
  * 靜態版：PeerJS 雲端信令 + WebRTC mesh，無需後端，可直接部署 GitHub Pages
+ *
+ * 房間生命週期（房間只住在房主的瀏覽器分頁）：
+ * - 房主分頁開著 → 房間持續存在，任何人可用「房間碼＋密碼」中途加入
+ * - 房主重新整理頁面 → 自動以同一組房間碼恢復房間；成員端會自動重連，房間不中斷
+ * - 房主主動按「離開」→ 廣播關房，所有人退出
+ * - 房主直接關閉分頁 → 成員端重連 90 秒，超過才判定房間關閉
  */
 (() => {
   'use strict';
@@ -9,9 +15,25 @@
   const ROOM_PREFIX = 'gh-room-'; // PeerJS peer ID 前綴，避免與其他 PeerJS 用戶碰撞
   const MAX_PARTICIPANTS = 8;
   const CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // 去掉易混淆的 I/O/0/1
-  const STUN_SERVERS = [
+  const HOST_RECONNECT_WINDOW_MS = 90_000;  // 房主斷線後，成員持續嘗試重連的時間
+  const BOOT_RESTORE_WINDOW_MS = 30_000;    // 頁面重新整理後，自動重新加入的嘗試時間
+  const RECONNECT_INTERVAL_MS = 3_000;      // 重連嘗試間隔
+  const JOIN_ATTEMPT_TIMEOUT_MS = 10_000;   // 單次加入嘗試的逾時
+  const AUTH_ATTEMPT_LIMIT = 5;             // 同一 peer 密碼錯誤次數上限（防暴力嘗試）
+
+  // STUN 用於 NAT 穿透；公開 TURN 作為無法直連時的備援（媒體仍是點對點 DTLS-SRTP 加密，TURN 只轉發密文）
+  const ICE_SERVERS = [
     { urls: 'stun:stun.l.google.com:19302' },
     { urls: 'stun:stun1.l.google.com:19302' },
+    {
+      urls: [
+        'turn:openrelay.metered.ca:80',
+        'turn:openrelay.metered.ca:443',
+        'turn:openrelay.metered.ca:443?transport=tcp',
+      ],
+      username: 'openrelayproject',
+      credential: 'openrelayproject',
+    },
   ];
 
   const state = {
@@ -32,8 +54,12 @@
     quality: 'ultra',
     statsTimer: null,
     updatingRoom: false,
-    iceServers: STUN_SERVERS,
   };
+
+  // 房主端：記錄每個 peer 密碼錯誤次數
+  const authFails = new Map();
+  // 成員端：房主斷線後的自動重連狀態
+  const reconnect = { timer: null, active: false, attempting: false };
 
   const tileEls = new Map();
   const audioEls = new Map();
@@ -54,6 +80,10 @@
       t.classList.add('fade');
       setTimeout(() => t.remove(), 350);
     }, 3800);
+  }
+
+  function sleep(ms) {
+    return new Promise((r) => setTimeout(r, ms));
   }
 
   function connLabel(peer) {
@@ -84,6 +114,35 @@
       b.textContent = text;
       b.className = 'conn-badge' + (cls ? ' ' + cls : '');
     }
+  }
+
+  /* ================= 本機狀態（讓房間在頁面重整後延續）================= */
+
+  const HOST_STATE_KEY = 'room.hostState';   // { code, name, password, nickname }
+  const CLIENT_STATE_KEY = 'room.clientState'; // { code, password, nickname }
+
+  function saveHostState(creds) {
+    try { sessionStorage.setItem(HOST_STATE_KEY, JSON.stringify(creds)); } catch {}
+  }
+
+  function saveClientState(creds) {
+    try { sessionStorage.setItem(CLIENT_STATE_KEY, JSON.stringify(creds)); } catch {}
+  }
+
+  function readStored(key) {
+    try {
+      const v = JSON.parse(sessionStorage.getItem(key));
+      return v && typeof v === 'object' ? v : null;
+    } catch {
+      return null;
+    }
+  }
+
+  function clearStoredState() {
+    try {
+      sessionStorage.removeItem(HOST_STATE_KEY);
+      sessionStorage.removeItem(CLIENT_STATE_KEY);
+    } catch {}
   }
 
   /* ================= 畫質設定 ================= */
@@ -126,7 +185,47 @@
     }
   }
 
-  /* ================= PeerJS 信令層（取代 Socket.IO）================= */
+  /* ================= PeerJS 連線層 ================= */
+
+  // 預設用 PeerJS 公開雲端；可用網址參數指定自架伺服器：?peerhost=x&peerport=9000&peerpath=/&pesecure=0
+  function peerOptions() {
+    const opts = { config: { iceServers: ICE_SERVERS }, debug: 1 };
+    try {
+      const q = new URLSearchParams(location.search);
+      if (q.get('peerhost')) {
+        opts.host = q.get('peerhost');
+        opts.port = Number(q.get('peerport') || 443);
+        opts.path = q.get('peerpath') || '/';
+        opts.secure = q.get('pesecure') === '1' || location.protocol === 'https:';
+      }
+    } catch {}
+    return opts;
+  }
+
+  function destroyPeer() {
+    if (state.peer) {
+      try { state.peer.destroy(); } catch {}
+      state.peer = null;
+    }
+  }
+
+  // PeerJS 與信號伺服器的 socket 短暫斷線時自動重連（不影響已建立的 P2P 連線，
+  // 但會影響「新房間碼可否被找到」，所以必須盡快恢復註冊）
+  function attachKeepalive(peer) {
+    peer.on('disconnected', () => {
+      if (peer.destroyed) return;
+      const retry = () => { try { peer.reconnect(); } catch {} };
+      retry();
+      setTimeout(() => { if (!peer.open && !peer.destroyed) retry(); }, 3000);
+    });
+    peer.on('error', (err) => {
+      if (!state.room) return;
+      console.warn('peer error:', err && err.type);
+      if (err && (err.type === 'network' || err.type === 'server-error')) {
+        setBadge('🟡 信號不穩，重試中…', 'warn');
+      }
+    });
+  }
 
   function sendTo(peerId, msg) {
     const conn = state.dataConns.get(peerId);
@@ -193,6 +292,11 @@
           state.participants = msg.participants;
           syncPeers(msg.participants);
         }
+        if (msg.passwordChanged && msg.newPassword) {
+          // 廣播新密碼給已在房內的成員：他們已通過驗證，帶著新密碼才能在斷線後自動重連
+          state.roomPassword = msg.newPassword;
+          saveClientState({ nickname: state.nickname, code: state.room.code, password: msg.newPassword });
+        }
         if (!state.updatingRoom) {
           if (msg.renamed) toast(`房主已將房間名稱改為「${msg.name}」`);
           if (msg.passwordChanged) toast('房主已更新房間密碼');
@@ -225,11 +329,6 @@
         }
         break;
       }
-
-      case 'auth-ok':
-      case 'auth-fail':
-        // 由 joinRoom 內部直接處理
-        break;
     }
   }
 
@@ -256,14 +355,14 @@
       toast(`${p.name} 離開了房間`);
     }
 
-    // 房主離開時，通知所有人並關閉房間
+    // 房主的連線斷了：可能是重新整理或短暫斷線，先自動重連，超過時限才判定關房
     if (p && p.isOwner && !state.isHost) {
-      toast('房主已離開，房間已關閉', 'error');
-      leaveRoomUI(true);
+      beginHostReconnect();
+      renderRoom();
       return;
     }
 
-    // 如果是房主，通知所有人
+    // 如果是房主，通知所有人更新名單
     if (p && state.isHost) {
       broadcast({ type: 'participants', participants: state.participants });
     }
@@ -277,6 +376,10 @@
 
     const conn = state.peer.connect(peerId, { serialization: 'json', reliable: true });
     conn.on('open', () => {
+      if (state.dataConns.has(peerId)) {
+        try { conn.close(); } catch {}
+        return;
+      }
       setupDataConn(conn);
       conn.send({
         type: 'hello',
@@ -289,6 +392,197 @@
     conn.on('error', (err) => {
       console.warn('Failed to connect to peer:', err);
     });
+  }
+
+  // 成員端：接收其他成員的主動連線（ID 較小的一方發起，hello 互補名單）
+  function registerClientIncoming(peer) {
+    peer.on('connection', (pconn) => {
+      pconn.on('open', () => {
+        if (state.dataConns.has(pconn.peer)) {
+          try { pconn.close(); } catch {}
+          return;
+        }
+        setupDataConn(pconn);
+        pconn.send({
+          type: 'hello',
+          name: state.nickname,
+          micOn: !!state.micStream,
+          micMuted: state.micMuted,
+          screenOn: !!state.screenStream,
+        });
+      });
+    });
+  }
+
+  /* ================= 加入流程（建房／加入共用底層）================= */
+
+  // 跨嘗試追蹤未決的加入連線：新嘗試開始時清掉舊的，避免同一成員建立多條連線
+  const pendingJoinConns = [];
+
+  /**
+   * 對房主 peer ID 建立資料連線並完成密碼驗證。
+   * 成功 resolve({ conn, data })；失敗 reject(Error)，err.fatal 表示重試也沒用（密碼錯誤／房間已滿）。
+   */
+  function attemptJoin(creds) {
+    return new Promise((resolve, reject) => {
+      while (pendingJoinConns.length) {
+        const c = pendingJoinConns.pop();
+        try { c.close(); } catch {}
+      }
+
+      let peer = state.peer;
+      if (!peer || peer.destroyed) {
+        peer = new Peer(peerOptions());
+        state.peer = peer;
+        attachKeepalive(peer);
+        registerClientIncoming(peer);
+        peer.on('open', (id) => { state.myId = id; });
+      }
+      if (!peer.open) {
+        try { peer.reconnect(); } catch {}
+      }
+
+      let done = false;
+      let openTimer = null;
+      const finish = (fn, arg) => {
+        if (done) return;
+        done = true;
+        clearTimeout(openTimer);
+        try { peer.off('error', onPeerError); } catch {}
+        fn(arg);
+      };
+      const onPeerError = (err) => {
+        const e = new Error(
+          err && err.type === 'peer-unavailable' ? '找不到房間' : `連線錯誤：${(err && err.type) || 'unknown'}`
+        );
+        finish(reject, e);
+      };
+      peer.on('error', onPeerError);
+
+      const onReady = () => {
+        if (done) return;
+        const hostId = ROOM_PREFIX + creds.code;
+        const conn = peer.connect(hostId, { serialization: 'json', reliable: true });
+        pendingJoinConns.push(conn);
+        const onConnData = (msg) => {
+          if (!msg || typeof msg.type !== 'string') return;
+          if (msg.type === 'auth-ok') {
+            finish(resolve, { conn, data: msg });
+          } else if (msg.type === 'auth-fail') {
+            const e = new Error(msg.error || '驗證失敗');
+            e.fatal = true;
+            finish(reject, e);
+          }
+        };
+        conn.on('data', onConnData);
+        conn.on('open', () => {
+          if (done) {
+            // 已有更新的嘗試勝出，這條遲到的連線直接關掉
+            try { conn.close(); } catch {}
+            return;
+          }
+          conn.send({ type: 'auth', password: creds.password, nickname: creds.nickname });
+        });
+        conn.on('error', (err) => finish(reject, new Error('連線錯誤：' + (err.message || 'unknown'))));
+        conn.on('close', () => finish(reject, new Error('連線中斷')));
+      };
+
+      if (peer.open) {
+        onReady();
+        openTimer = setTimeout(() => finish(reject, new Error('連線逾時')), JOIN_ATTEMPT_TIMEOUT_MS);
+      } else {
+        peer.once('open', onReady);
+        openTimer = setTimeout(() => finish(reject, new Error('連線逾時')), JOIN_ATTEMPT_TIMEOUT_MS);
+      }
+    });
+  }
+
+  /** 成員進房共用入口：建立狀態、同步名單與媒體連線。保留現有麥克風／螢幕分享。 */
+  function acceptJoin(conn, data, creds) {
+    const newId = data.self || (state.peer && state.peer.id) || state.myId;
+
+    if (state.myId && newId !== state.myId) {
+      // 斷線後換了新的 peer ID：舊的媒體／資料連線全部作廢，重建
+      closeAllPeers();
+      for (const [, c] of state.dataConns) {
+        if (c !== conn) { try { c.close(); } catch {} }
+      }
+      state.dataConns.clear();
+      clearTiles();
+    }
+
+    state.myId = newId;
+    state.room = data.room;
+    state.roomPassword = creds.password;
+    state.nickname = creds.nickname;
+    state.participants = Array.isArray(data.participants) ? data.participants : [];
+
+    // 房主頁面重整後，指向房主的舊 RTCPeerConnection 已死（對方物件不存在了），
+    // 不是 connected 就強制重建，否則 addPeer 會回傳舊的死連線，收不到房主的媒體
+    const hostPc = state.peers.get(conn.peer);
+    if (hostPc && hostPc.pc.connectionState !== 'connected') {
+      try { hostPc.pc.close(); } catch {}
+      state.peers.delete(conn.peer);
+      removeAudioFor(conn.peer);
+    }
+
+    setupDataConn(conn);
+    syncPeers(state.participants);
+
+    if (!state.isHost) saveClientState(creds);
+    setBadge('🟢 已連線', 'on');
+    enterRoom();
+  }
+
+  function beginHostReconnect() {
+    if (reconnect.active) return;
+    const creds = {
+      nickname: state.nickname,
+      code: state.room && state.room.code,
+      password: state.roomPassword,
+    };
+    if (!creds.code || !creds.password) return leaveRoomUI(true);
+    saveClientState(creds);
+
+    const deadline = Date.now() + HOST_RECONNECT_WINDOW_MS;
+    reconnect.active = true;
+    reconnect.attempting = false;
+    toast(`與房主的連線中斷，${Math.round(HOST_RECONNECT_WINDOW_MS / 1000)} 秒內自動重連…`);
+
+    reconnect.timer = setInterval(async () => {
+      if (!reconnect.active) return;
+      const left = Math.max(0, Math.round((deadline - Date.now()) / 1000));
+      setBadge(`🟡 房主暫時離線，重連中（${left}s）…`, 'warn');
+      if (Date.now() >= deadline) return hostReconnectFailed();
+      if (reconnect.attempting) return;
+      reconnect.attempting = true;
+      try {
+        const { conn, data } = await attemptJoin(creds);
+        stopReconnect();
+        reconnect.active = false;
+        acceptJoin(conn, data, creds);
+        toast('已重新連上房主', 'success');
+      } catch (err) {
+        reconnect.attempting = false;
+        if (err.fatal) {
+          toast('無法重連：' + err.message, 'error');
+          hostReconnectFailed();
+        }
+        // 其他錯誤（房主還沒回來）等下一輪再試
+      }
+    }, RECONNECT_INTERVAL_MS);
+  }
+
+  function hostReconnectFailed() {
+    stopReconnect();
+    reconnect.active = false;
+    toast('房主已離開，房間已關閉', 'error');
+    leaveRoomUI(true);
+  }
+
+  function stopReconnect() {
+    if (reconnect.timer) clearInterval(reconnect.timer);
+    reconnect.timer = null;
   }
 
   /* ================= WebRTC（perfect negotiation）================= */
@@ -332,7 +626,7 @@
     const existing = state.peers.get(peerId);
     if (existing) return existing;
 
-    const pc = new RTCPeerConnection({ iceServers: state.iceServers, bundlePolicy: 'max-bundle' });
+    const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS, bundlePolicy: 'max-bundle' });
     const peer = {
       pc,
       polite: state.myId < peerId,
@@ -372,7 +666,8 @@
           }
         });
         e.track.addEventListener('unmute', () => renderRoom());
-      } else {
+      } else if (stream.getVideoTracks().length === 0) {
+        // 純語音流（螢幕分享的聲音跟著視訊流走，由 tile 的 <video> 播放）
         attachRemoteAudio(peerId, stream);
       }
       renderRoom();
@@ -389,6 +684,7 @@
       renderRoom();
     };
 
+    // 建立當下就把既有媒體軌加上：中途加入的人立刻收到目前的麥克風／螢幕分享
     if (state.micTrack && state.micStream) pc.addTrack(state.micTrack, state.micStream);
     if (state.screenTrack && state.screenStream) {
       const sender = pc.addTrack(state.screenTrack, state.screenStream);
@@ -816,10 +1112,7 @@
     $('#view-room').classList.toggle('hidden', !inRoom);
   }
 
-  function enterRoom(res) {
-    state.myId = res.self;
-    state.room = res.room;
-    state.participants = Array.isArray(res.participants) ? res.participants : [];
+  function enterRoom() {
     showView(true);
     renderRoom();
     updateControlBar();
@@ -828,6 +1121,8 @@
 
   async function leaveRoomUI(silent = false) {
     if (!state.room) return;
+    stopReconnect();
+    reconnect.active = false;
     stopStats();
     stopMic();
     await stopScreenShare();
@@ -840,29 +1135,90 @@
     }
     state.dataConns.clear();
 
-    // 房主離開時通知所有人
+    // 房主主動離開時通知所有人關房
     if (state.isHost && !silent) {
       broadcast({ type: 'room:closed' });
     }
 
-    // 銷毀 PeerJS 實例
-    if (state.peer) {
-      try { state.peer.destroy(); } catch {}
-      state.peer = null;
-    }
+    destroyPeer();
+    clearStoredState();
 
     state.room = null;
     state.myId = null;
     state.participants = [];
     state.isHost = false;
     state.roomPassword = null;
+    $('#btn-create').disabled = false;
+    $('#btn-join').disabled = false;
     setBadge('就緒', 'on');
     showView(false);
   }
 
-  /* ================= 大廳：建房 / 加入 ================= */
+  /* ================= 房主：建房 ================= */
 
-  async function createRoom() {
+  function startHost(creds, opts = {}) {
+    const restoring = !!opts.restoring;
+    let attempts = opts.attempts || 0;
+    state.nickname = creds.nickname;
+    state.isHost = true;
+    state.roomPassword = creds.password;
+    setBadge('連線中…', '');
+
+    const peer = new Peer(ROOM_PREFIX + creds.code, peerOptions());
+    state.peer = peer;
+    attachKeepalive(peer);
+
+    let opened = false;
+
+    peer.once('open', (id) => {
+      opened = true;
+      state.myId = id;
+      state.room = { code: creds.code, name: creds.name };
+      state.participants = [{
+        id, name: creds.nickname, micOn: false, micMuted: false, screenOn: false, isOwner: true,
+      }];
+      saveHostState(creds);
+      registerHostHandlers(peer);
+      setBadge('🟢 已連線', 'on');
+      enterRoom();
+      toast(
+        restoring
+          ? `已恢復房主身分，房間碼不變：${creds.code}`
+          : `房間建立成功！房間碼：${creds.code}`,
+        'success'
+      );
+    });
+
+    peer.on('error', (err) => {
+      if (opened) return; // 建房後的錯誤由 attachKeepalive / 連線層處理
+      if (err.type === 'unavailable-id') {
+        // 房間碼剛好被占用（剛重整時舊連線尚未釋放、或極小機率撞碼）
+        try { peer.destroy(); } catch {}
+        if (state.peer === peer) state.peer = null;
+        if (restoring) {
+          // 恢復模式：堅持用同一組房間碼重試，維持房間延續性
+          if (++attempts <= 8) {
+            setTimeout(() => startHost(creds, { restoring: true, attempts }), 2000);
+          } else {
+            clearStoredState();
+            $('#btn-create').disabled = false;
+            setBadge('就緒', 'on');
+            toast('無法恢復房間（房間碼暫時被占用），請重新建立房間', 'error');
+          }
+        } else {
+          startHost({ ...creds, code: makeRoomCode() });
+        }
+        return;
+      }
+      $('#btn-create').disabled = false;
+      setBadge('🔴 連線錯誤', 'off');
+      toast('連線錯誤：' + err.type, 'error');
+      try { peer.destroy(); } catch {}
+      if (state.peer === peer) state.peer = null;
+    });
+  }
+
+  function createRoom() {
     const nickname = $('#nickname').value.trim();
     const name = $('#create-name').value.trim();
     const password = $('#create-password').value;
@@ -870,102 +1226,82 @@
     if (!name) return toast('請填寫房間名稱', 'error');
     if (!password || password.length < 4) return toast('請設定至少 4 字的房間密碼', 'error');
 
+    clearStoredState(); // 本分頁角色切換：清掉可能殘留的成員身分
     $('#btn-create').disabled = true;
-    setBadge('連線中…', '');
+    startHost({ nickname, name, password, code: makeRoomCode() });
+  }
 
-    const code = makeRoomCode();
-    const peerId = `${ROOM_PREFIX}${code}`;
+  // 房主端：處理加入者的密碼驗證
+  function registerHostHandlers(peer) {
+    peer.on('connection', (conn) => {
+      let authenticated = false;
+      // 10 秒內沒完成驗證就斷開，避免空連線占著
+      const authTimeout = setTimeout(() => {
+        if (!authenticated) { try { conn.close(); } catch {} }
+      }, 10_000);
 
-    const peer = new Peer(peerId, {
-      config: { iceServers: state.iceServers },
-      debug: 1,
-    });
+      conn.on('data', (msg) => {
+        if (!msg || msg.type !== 'auth' || authenticated) return;
+        clearTimeout(authTimeout);
 
-    state.peer = peer;
-    state.nickname = nickname;
-    state.isHost = true;
+        if ((authFails.get(conn.peer) || 0) >= AUTH_ATTEMPT_LIMIT) {
+          try { conn.close(); } catch {}
+          return;
+        }
+        if (String(msg.password) !== state.roomPassword) {
+          authFails.set(conn.peer, (authFails.get(conn.peer) || 0) + 1);
+          conn.send({ type: 'auth-fail', error: '密碼錯誤' });
+          setTimeout(() => { try { conn.close(); } catch {} }, 500);
+          return;
+        }
+        if (state.participants.length >= MAX_PARTICIPANTS) {
+          conn.send({ type: 'auth-fail', error: `房間已滿（上限 ${MAX_PARTICIPANTS} 人）` });
+          setTimeout(() => { try { conn.close(); } catch {} }, 500);
+          return;
+        }
 
-    peer.on('open', (id) => {
-      state.myId = id;
-      state.room = { code, name };
-      state.roomPassword = password;
-      state.participants = [{
-        id, name: nickname, micOn: false, micMuted: false, screenOn: false, isOwner: true,
-      }];
-      setBadge('🟢 已連線', 'on');
+        authenticated = true;
+        authFails.delete(conn.peer);
+        if (!state.participants.some((p) => p.id === conn.peer)) {
+          state.participants.push({
+            id: conn.peer,
+            name: String(msg.nickname || '未知').slice(0, 20),
+            micOn: false,
+            micMuted: false,
+            screenOn: false,
+            isOwner: false,
+          });
+        }
+        setupDataConn(conn);
 
-      // 房主接收加入者的 data connection
-      peer.on('connection', (conn) => {
-        let authenticated = false;
-
-        conn.on('data', (msg) => {
-          if (msg.type === 'auth' && !authenticated) {
-            if (msg.password !== state.roomPassword) {
-              conn.send({ type: 'auth-fail', error: '密碼錯誤' });
-              setTimeout(() => { try { conn.close(); } catch {} }, 500);
-              return;
-            }
-            if (state.participants.length >= MAX_PARTICIPANTS) {
-              conn.send({ type: 'auth-fail', error: `房間已滿（上限 ${MAX_PARTICIPANTS} 人）` });
-              setTimeout(() => { try { conn.close(); } catch {} }, 500);
-              return;
-            }
-
-            authenticated = true;
-            state.participants.push({
-              id: conn.peer, name: msg.nickname, micOn: false, micMuted: false, screenOn: false, isOwner: false,
-            });
-            setupDataConn(conn);
-
-            // 回傳參與者列表
-            conn.send({
-              type: 'auth-ok',
-              self: conn.peer,
-              room: state.room,
-              participants: state.participants,
-            });
-
-            // 通知所有人更新列表
-            broadcast({ type: 'participants', participants: state.participants });
-            toast(`${msg.nickname} 加入了房間`, 'success');
-          } else if (authenticated) {
-            handleDataMessage(conn.peer, msg);
-          }
+        conn.send({
+          type: 'auth-ok',
+          self: conn.peer,
+          room: state.room,
+          participants: state.participants,
         });
-
-        conn.on('close', () => {
-          if (authenticated) onPeerDisconnect(conn.peer);
-        });
-
-        conn.on('error', (err) => {
-          console.warn('Host conn error:', err);
-        });
+        broadcast({ type: 'participants', participants: state.participants });
+        // 房主主動與新成員建立媒體連線：中途加入者立刻收到目前的麥克風／螢幕分享
+        syncPeers(state.participants);
+        toast(`${msg.nickname} 加入了房間`, 'success');
       });
 
-      // 房主也接收 incoming WebRTC media calls（由 ontrack 處理，不需額外 handler）
-      peer.on('call', (call) => {
-        const stream = state.micStream || new MediaStream();
-        call.answer(stream);
+      conn.on('close', () => {
+        clearTimeout(authTimeout);
+        // 只有「目前登記中的那條連線」斷開才算成員離開；
+        // 重複連線會被 dedupe 關閉，不能誤判成離開
+        if (authenticated && state.dataConns.get(conn.peer) === conn) {
+          onPeerDisconnect(conn.peer);
+        }
       });
 
-      enterRoom({ self: id, room: state.room, participants: state.participants });
-      toast(`房間建立成功！房間碼：${code}`, 'success');
-    });
-
-    peer.on('error', (err) => {
-      $('#btn-create').disabled = false;
-      if (err.type === 'unavailable-id') {
-        // 房間碼碰撞，自動重試
-        try { peer.destroy(); } catch {}
-        state.peer = null;
-        return createRoom();
-      }
-      setBadge('🔴 連線錯誤', 'off');
-      toast('連線錯誤：' + err.type, 'error');
-      try { peer.destroy(); } catch {}
-      state.peer = null;
+      conn.on('error', (err) => {
+        console.warn('Host conn error:', err);
+      });
     });
   }
+
+  /* ================= 成員：加入 ================= */
 
   async function joinRoom() {
     const nickname = $('#nickname').value.trim();
@@ -975,106 +1311,39 @@
     if (!code) return toast('請填寫房間碼', 'error');
     if (!password) return toast('請填寫房間密碼', 'error');
 
+    clearStoredState(); // 本分頁角色切換：清掉可能殘留的房主身分
     $('#btn-join').disabled = true;
     setBadge('連線中…', '');
 
-    const peer = new Peer({ config: { iceServers: state.iceServers }, debug: 1 });
-    state.peer = peer;
-    state.nickname = nickname;
+    const creds = { nickname, code, password };
     state.isHost = false;
+    state.nickname = nickname;
 
-    let authTimer = null;
-
-    peer.on('open', (id) => {
-      state.myId = id;
-      const hostId = `${ROOM_PREFIX}${code}`;
-      const conn = peer.connect(hostId, { serialization: 'json', reliable: true });
-
-      authTimer = setTimeout(() => {
-        toast('連線逾時：找不到房間，請確認房間碼正確', 'error');
-        $('#btn-join').disabled = false;
-        setBadge('就緒', 'on');
-        try { peer.destroy(); } catch {}
-        state.peer = null;
-      }, 10000);
-
-      conn.on('open', () => {
-        conn.send({ type: 'auth', password, nickname });
-      });
-
-      conn.on('data', (msg) => {
-        if (msg.type === 'auth-ok') {
-          clearTimeout(authTimer);
-          state.room = msg.room;
-          state.roomPassword = password;
-          state.participants = msg.participants;
-          setupDataConn(conn);
-          setBadge('🟢 已連線', 'on');
-
-          // 連接到其他所有參與者（非房主、非自己）
-          const others = msg.participants.filter(
-            (p) => p.id !== state.myId && p.id !== conn.peer
-          );
-          for (const p of others) {
-            connectToPeer(p.id);
-          }
-
-          // 接收其他人的主動連線
-          peer.on('connection', (pconn) => {
-            if (!state.dataConns.has(pconn.peer)) {
-              pconn.on('open', () => {
-                setupDataConn(pconn);
-                pconn.send({
-                  type: 'hello',
-                  name: state.nickname,
-                  micOn: !!state.micStream,
-                  micMuted: state.micMuted,
-                  screenOn: !!state.screenStream,
-                });
-              });
-            }
-          });
-
-          // 接收 incoming media calls
-          peer.on('call', (call) => {
-            const stream = state.micStream || new MediaStream();
-            call.answer(stream);
-          });
-
-          enterRoom(msg);
-          toast(`已加入「${msg.room.name}」`, 'success');
-        } else if (msg.type === 'auth-fail') {
-          clearTimeout(authTimer);
-          toast(msg.error, 'error');
-          $('#btn-join').disabled = false;
-          setBadge('就緒', 'on');
-          try { peer.destroy(); } catch {}
-          state.peer = null;
-        }
-      });
-
-      conn.on('error', (err) => {
-        clearTimeout(authTimer);
-        toast('連線錯誤：' + (err.message || '找不到房間'), 'error');
-        $('#btn-join').disabled = false;
-        setBadge('就緒', 'on');
-        try { peer.destroy(); } catch {}
-        state.peer = null;
-      });
-    });
-
-    peer.on('error', (err) => {
-      if (authTimer) clearTimeout(authTimer);
-      $('#btn-join').disabled = false;
-      if (err.type === 'peer-unavailable') {
-        toast('找不到這個房間碼，請向房主確認', 'error');
-      } else {
-        toast('連線錯誤：' + err.type, 'error');
+    let lastErr = null;
+    // 短暫的網路／信號抖動自動重試，不必讓使用者手動再點一次
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        const { conn, data } = await attemptJoin(creds);
+        acceptJoin(conn, data, creds);
+        toast(`已加入「${data.room.name}」`, 'success');
+        return;
+      } catch (err) {
+        lastErr = err;
+        if (err.fatal) break;
+        destroyPeer();
+        if (attempt < 2) await sleep(2500);
       }
-      setBadge('🔴 連線錯誤', 'off');
-      try { peer.destroy(); } catch {}
-      state.peer = null;
-    });
+    }
+
+    destroyPeer();
+    $('#btn-join').disabled = false;
+    setBadge('🔴 連線錯誤', 'off');
+    toast(
+      lastErr && lastErr.message === '找不到房間'
+        ? '找不到這個房間碼，請向房主確認'
+        : (lastErr && lastErr.message) || '連線失敗',
+      'error'
+    );
   }
 
   /* ================= 房主設定 ================= */
@@ -1089,7 +1358,7 @@
     $('#modal-settings').classList.add('hidden');
   }
 
-  async function saveSettings() {
+  function saveSettings() {
     const name = $('#set-name').value.trim();
     const password = $('#set-password').value;
     if (!name) return toast('房間名稱不可空白', 'error');
@@ -1107,6 +1376,7 @@
       name,
       renamed,
       passwordChanged,
+      newPassword: password || undefined, // 告知已在房內的成員，讓他們斷線後仍能自動重連
       participants: state.participants,
     });
 
@@ -1154,11 +1424,8 @@
       });
     }
 
-    window.addEventListener('beforeunload', () => {
-      if (state.isHost && state.room) {
-        broadcast({ type: 'room:closed' });
-      }
-    });
+    // 注意：這裡刻意不做 beforeunload 關房 —— 房主「重新整理」不算退出房間，
+    // 房間要靠本機狀態＋成員端自動重連延續；只有房主主動按「離開」才關房。
 
     if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) {
       const btn = $('#btn-screen');
@@ -1169,7 +1436,28 @@
 
   /* ================= 啟動 ================= */
 
-  function boot() {
+  /** 成員身分自動恢復（重新整理後），30 秒內反覆嘗試（房主可能也正在重整） */
+  async function tryRestoreClient(creds) {
+    const deadline = Date.now() + BOOT_RESTORE_WINDOW_MS;
+    while (Date.now() < deadline) {
+      try {
+        const { conn, data } = await attemptJoin(creds);
+        acceptJoin(conn, data, creds);
+        toast('已重新加入房間', 'success');
+        return true;
+      } catch (err) {
+        if (err.fatal) {
+          toast(err.message, 'error');
+          return false;
+        }
+        destroyPeer();
+        await sleep(RECONNECT_INTERVAL_MS);
+      }
+    }
+    return false;
+  }
+
+  async function boot() {
     bindUI();
 
     // 靜態版無房間列表，改為提示
@@ -1179,6 +1467,30 @@
       box.appendChild(
         el('p', 'muted', '靜態版無法顯示房間列表。請直接輸入房間碼加入，或建立新房間。')
       );
+    }
+
+    const hostState = readStored(HOST_STATE_KEY);
+    const clientState = readStored(CLIENT_STATE_KEY);
+
+    if (hostState && hostState.code && hostState.name && hostState.password && hostState.nickname) {
+      // 房主重新整理：自動以同一組房間碼恢復房間，房間碼與密碼都不變
+      setBadge('恢復房間中…', '');
+      startHost(hostState, { restoring: true });
+      return;
+    }
+
+    if (clientState && clientState.code && clientState.password && clientState.nickname) {
+      // 成員重新整理：自動重新加入同一個房間
+      state.isHost = false;
+      setBadge('重新加入房間中…', '');
+      const ok = await tryRestoreClient(clientState);
+      if (!ok) {
+        destroyPeer();
+        clearStoredState();
+        setBadge('就緒', 'on');
+        toast('房間目前連不上（可能已關閉），請重新加入', 'info');
+      }
+      return;
     }
 
     setBadge('就緒', 'on');
