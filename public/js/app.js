@@ -43,6 +43,8 @@
     roomPassword: null,
     isHost: false,
     nickname: '',
+    profile: { name: '', avatar: null }, // 個人中心：本機保存的暱稱／頭像
+    avatars: new Map(),   // peerId -> 頭像 dataURL（其他成員的頭像，經 hello／profile 同步）
     participants: [],     // [{ id, name, micOn, micMuted, screenOn, isOwner }]
     dataConns: new Map(), // peerId -> DataConnection
     peers: new Map(),     // peerId -> { pc, polite, makingOffer, ignoreOffer, videoStream, stats, connState }
@@ -85,7 +87,8 @@
     urls: [],             // 已建立的 blob URL，離開房間時一併撤銷
     welcomed: false,
   };
-  const FILE_CHUNK = 60_000;           // 每片原始位元組（base64 後約 80KB，低於瀏覽器訊息上限）
+  const FILE_CHUNK = 8_192;            // 每片原始位元組。base64 後約 11KB：必須低於 PeerJS chunkedMTU(16300)
+                                       // 與 Safari 64KB 的 SCTP 訊息上限，否則大訊息會被静默丢棄導致「傳輸不完整」
   const FILE_MAX = 200 * 1024 * 1024;  // 單一檔案上限
   const FILE_BUFFER_HIGH = 8 * 1024 * 1024;
   const fileQueue = [];
@@ -115,6 +118,123 @@
 
   function nameHue(name) {
     return [...(name || '?')].reduce((a, c) => a + c.codePointAt(0), 0) % 360;
+  }
+
+  /* ================= 個人中心 ================= */
+
+  function loadProfile() {
+    try {
+      const p = JSON.parse(localStorage.getItem(PROFILE_KEY));
+      if (p && typeof p === 'object') {
+        return {
+          name: typeof p.name === 'string' ? p.name.slice(0, 20) : '',
+          avatar: typeof p.avatar === 'string' && p.avatar.startsWith('data:image/') ? p.avatar : null,
+        };
+      }
+    } catch {}
+    return { name: '', avatar: null };
+  }
+
+  function saveProfile() {
+    try { localStorage.setItem(PROFILE_KEY, JSON.stringify(state.profile)); } catch {}
+  }
+
+  /** 頭像圖片統一裁成 128×128 方形 JPEG（約 4-8KB），可直接放進 localStorage 與 P2P 訊息 */
+  function compressAvatar(file) {
+    return new Promise((resolve, reject) => {
+      if (!file.type.startsWith('image/')) return reject(new Error('請選擇圖片檔'));
+      const url = URL.createObjectURL(file);
+      const img = new Image();
+      img.onload = () => {
+        try {
+          const SIZE = 128;
+          const cv = document.createElement('canvas');
+          cv.width = SIZE;
+          cv.height = SIZE;
+          const ctx = cv.getContext('2d');
+          const s = Math.max(SIZE / img.width, SIZE / img.height);
+          const w = img.width * s;
+          const h = img.height * s;
+          ctx.drawImage(img, (SIZE - w) / 2, (SIZE - h) / 2, w, h);
+          resolve(cv.toDataURL('image/jpeg', 0.82));
+        } catch (err) {
+          reject(err);
+        } finally {
+          URL.revokeObjectURL(url);
+        }
+      };
+      img.onerror = () => {
+        URL.revokeObjectURL(url);
+        reject(new Error('圖片載入失敗'));
+      };
+      img.src = url;
+    });
+  }
+
+  /** 取某成員的頭像：自己用本機 profile，其他人用同步過來的 avatars 表 */
+  function avatarFor(id) {
+    if (id === state.myId) return state.profile.avatar;
+    return state.avatars.get(id) || null;
+  }
+
+  /** 把頭像（圖片或字首圓）畫到指定元素上 */
+  function applyAvatar(elm, id, name) {
+    if (!elm) return;
+    const img = avatarFor(id);
+    if (img) {
+      elm.textContent = '';
+      elm.style.backgroundImage = `url("${img}")`;
+      elm.classList.add('avatar-img');
+      return;
+    }
+    elm.style.backgroundImage = '';
+    elm.classList.remove('avatar-img');
+    elm.textContent = (name || '?').charAt(0).toUpperCase();
+    elm.style.setProperty('--h', nameHue(name));
+  }
+
+  /** 大廳的頭像預覽跟著暱稱即時變動 */
+  function renderLobbyAvatar() {
+    const av = $('#lobby-avatar');
+    if (!av) return;
+    if (state.profile.avatar) {
+      av.textContent = '';
+      av.style.backgroundImage = `url("${state.profile.avatar}")`;
+      av.classList.add('avatar-img');
+      return;
+    }
+    av.style.backgroundImage = '';
+    av.classList.remove('avatar-img');
+    const name = $('#nickname').value.trim();
+    av.textContent = (name || '?').charAt(0).toUpperCase();
+    av.style.setProperty('--h', nameHue(name));
+  }
+
+  /** 套用新暱稱／頭像：更新本機、房內名單，並廣播給其他成員 */
+  function applyMyProfile(name, avatar) {
+    state.profile = { name, avatar };
+    saveProfile();
+
+    if (state.nickname !== name) {
+      state.nickname = name;
+      const me = state.participants.find((p) => p.id === state.myId);
+      if (me) me.name = name;
+    }
+    if (state.room) {
+      broadcast({ type: 'profile', name, avatar: avatar || null });
+      renderRoom();
+    }
+    renderLobbyAvatar();
+  }
+
+  /** 房主端：目前房內所有人的頭像（自己用 profile，其他用同步表），排除指定成員 */
+  function avatarsSnapshotFor(excludeId) {
+    const out = {};
+    if (state.profile.avatar) out[state.myId] = state.profile.avatar;
+    for (const [id, av] of state.avatars) {
+      if (id !== excludeId && av) out[id] = av;
+    }
+    return out;
   }
 
   function fmtBytes(n) {
@@ -204,6 +324,7 @@
 
   const HOST_STATE_KEY = 'room.hostState';   // { code, name, password, nickname }
   const CLIENT_STATE_KEY = 'room.clientState'; // { code, password, nickname }
+  const PROFILE_KEY = 'room.profile';        // 個人中心：{ name, avatar }，長期保存在這部裝置
 
   function saveHostState(creds) {
     try { sessionStorage.setItem(HOST_STATE_KEY, JSON.stringify(creds)); } catch {}
@@ -491,7 +612,7 @@
         const got = t.chunks.filter(Boolean).length;
         if (got !== expected) {
           t.failed = true;
-          setTransferStatus(t, '傳輸不完整');
+          setTransferStatus(t, `傳輸不完整（收到 ${got}/${expected} 片）`);
         } else {
           finalizeTransfer(t);
         }
@@ -514,6 +635,9 @@
 
       case 'hello': {
         const existing = state.participants.find((p) => p.id === fromPeerId);
+        if (typeof msg.avatar === 'string' && msg.avatar.startsWith('data:image/')) {
+          state.avatars.set(fromPeerId, msg.avatar);
+        }
         if (!existing) {
           state.participants.push({
             id: fromPeerId,
@@ -529,10 +653,31 @@
             toast(`${msg.name} 加入了房間`, 'success');
             addSysMsg(`${msg.name} 加入了房間`);
           }
-        } else if (msg.name && existing.name !== msg.name) {
-          existing.name = msg.name;
+        } else {
+          if (msg.name && existing.name !== msg.name) existing.name = msg.name;
           renderRoom();
         }
+        break;
+      }
+
+      case 'profile': {
+        // 其他成員更新了暱稱／頭像
+        if (typeof msg.avatar === 'string' && msg.avatar.startsWith('data:image/')) {
+          state.avatars.set(fromPeerId, msg.avatar);
+        } else if (msg.avatar === null) {
+          state.avatars.delete(fromPeerId);
+        }
+        const p = state.participants.find((x) => x.id === fromPeerId);
+        if (p && typeof msg.name === 'string' && msg.name && p.name !== msg.name) {
+          p.name = msg.name.slice(0, 20);
+          toast(`${msg.name} 更新了個人資料`);
+          addSysMsg(`${p.name} 更名為 ${msg.name}`);
+        }
+        if (state.isHost) {
+          // 房主維護權威名單：同步後重播給所有人收斂
+          broadcast({ type: 'participants', participants: state.participants });
+        }
+        renderRoom();
         break;
       }
     }
@@ -593,6 +738,7 @@
       conn.send({
         type: 'hello',
         name: state.nickname,
+        avatar: state.profile.avatar || undefined,
         micOn: !!state.micStream,
         micMuted: state.micMuted,
         screenOn: !!state.screenStream,
@@ -615,6 +761,7 @@
         pconn.send({
           type: 'hello',
           name: state.nickname,
+          avatar: state.profile.avatar || undefined,
           micOn: !!state.micStream,
           micMuted: state.micMuted,
           screenOn: !!state.screenStream,
@@ -726,6 +873,13 @@
     state.nickname = creds.nickname;
     state.participants = Array.isArray(data.participants) ? data.participants : [];
 
+    // 房主在 auth-ok 附上目前成員的頭像，中途加入立即看得到大家的大頭照
+    if (data.avatars && typeof data.avatars === 'object') {
+      for (const [id, av] of Object.entries(data.avatars)) {
+        if (typeof av === 'string' && av.startsWith('data:image/')) state.avatars.set(id, av);
+      }
+    }
+
     // 房主頁面重整後，指向房主的舊 RTCPeerConnection 已死（對方物件不存在了），
     // 不是 connected 就強制重建，否則 addPeer 會回傳舊的死連線，收不到房主的媒體
     const hostPc = state.peers.get(conn.peer);
@@ -737,6 +891,16 @@
 
     setupDataConn(conn);
     syncPeers(state.participants);
+
+    // 向房主補一份 hello：讓房主立即拿到自己的頭像（auth 只帶了暱稱）
+    sendTo(conn.peer, {
+      type: 'hello',
+      name: state.nickname,
+      avatar: state.profile.avatar || undefined,
+      micOn: !!state.micStream,
+      micMuted: state.micMuted,
+      screenOn: !!state.screenStream,
+    });
 
     if (!state.isHost) saveClientState(creds);
     setBadge('🟢 已連線', 'on');
@@ -1331,10 +1495,7 @@
       tile.waitingEl.classList.toggle('hidden', !(p.screenOn && !hasVideo));
       tile.root.classList.toggle('has-video', hasVideo);
 
-      const initial = (p.name || '?').charAt(0).toUpperCase();
-      const hue = [...p.name].reduce((a, c) => a + c.codePointAt(0), 0) % 360;
-      tile.avatarCircle.textContent = initial;
-      tile.avatarCircle.style.setProperty('--h', hue);
+      applyAvatar(tile.avatarCircle, p.id, p.name);
 
       const label = isSelf ? '' : connLabel(peer);
       tile.stateEl.textContent = label;
@@ -1418,8 +1579,8 @@
 
     const root = el('div', 'msg ' + (isSelf ? 'me' : 'them') + (grouped ? ' grouped' : ''));
     if (!isSelf && !grouped) {
-      const av = el('div', 'msg-avatar', (name || '?').charAt(0).toUpperCase());
-      av.style.setProperty('--h', nameHue(name));
+      const av = el('div', 'msg-avatar');
+      applyAvatar(av, fromId, name);
       root.appendChild(av);
     }
     const col = el('div', 'msg-col');
@@ -1926,6 +2087,7 @@
           self: conn.peer,
           room: state.room,
           participants: state.participants,
+          avatars: avatarsSnapshotFor(conn.peer),
         });
         broadcast({ type: 'participants', participants: state.participants });
         // 房主主動與新成員建立媒體連線：中途加入者立刻收到目前的麥克風／螢幕分享
@@ -2006,6 +2168,46 @@
     $('#modal-settings').classList.add('hidden');
   }
 
+  /* ================= 個人中心彈窗 ================= */
+
+  let pendingAvatar = null; // 彈窗中暫存的新頭像（未儲存前不生效）
+
+  function renderProfilePreview() {
+    const prev = $('#profile-avatar-preview');
+    if (!prev) return;
+    if (pendingAvatar) {
+      prev.textContent = '';
+      prev.style.backgroundImage = `url("${pendingAvatar}")`;
+      prev.classList.add('avatar-img');
+    } else {
+      prev.style.backgroundImage = '';
+      prev.classList.remove('avatar-img');
+      const name = $('#profile-name').value.trim();
+      prev.textContent = (name || '?').charAt(0).toUpperCase();
+      prev.style.setProperty('--h', nameHue(name));
+    }
+  }
+
+  function openProfileModal() {
+    $('#profile-name').value = state.profile.name || $('#nickname').value.trim();
+    pendingAvatar = state.profile.avatar;
+    renderProfilePreview();
+    $('#modal-profile').classList.remove('hidden');
+  }
+
+  function closeProfileModal() {
+    $('#modal-profile').classList.add('hidden');
+  }
+
+  function saveProfileModal() {
+    const name = $('#profile-name').value.trim();
+    if (!name) return toast('請填寫暱稱', 'error');
+    applyMyProfile(name, pendingAvatar);
+    $('#nickname').value = name;
+    closeProfileModal();
+    toast('個人資料已儲存，下次開啟自動帶入', 'success');
+  }
+
   function saveSettings() {
     const name = $('#set-name').value.trim();
     const password = $('#set-password').value;
@@ -2060,6 +2262,31 @@
     $('#modal-settings').addEventListener('click', (e) => {
       if (e.target === $('#modal-settings')) closeSettings();
     });
+
+    /* ---------- 個人中心 ---------- */
+    $('#btn-profile').addEventListener('click', openProfileModal);
+    $('#btn-profile-cancel').addEventListener('click', closeProfileModal);
+    $('#btn-profile-save').addEventListener('click', saveProfileModal);
+    $('#modal-profile').addEventListener('click', (e) => {
+      if (e.target === $('#modal-profile')) closeProfileModal();
+    });
+    $('#btn-avatar-upload').addEventListener('click', () => $('#avatar-file').click());
+    $('#btn-avatar-remove').addEventListener('click', () => {
+      pendingAvatar = null;
+      renderProfilePreview();
+    });
+    $('#avatar-file').addEventListener('change', async (e) => {
+      const file = e.target.files && e.target.files[0];
+      e.target.value = '';
+      if (!file) return;
+      try {
+        pendingAvatar = await compressAvatar(file);
+        renderProfilePreview();
+      } catch (err) {
+        toast(err.message || '頭像處理失敗', 'error');
+      }
+    });
+    $('#nickname').addEventListener('input', renderLobbyAvatar);
 
     for (const id of ['create-name', 'create-password']) {
       $('#' + id).addEventListener('keydown', (e) => {
@@ -2175,8 +2402,39 @@
     return false;
   }
 
+  /* ================= 深淺色主題 ================= */
+
+  const THEME_KEY = 'room.theme';
+
+  function applyTheme(theme) {
+    const t = theme === 'dark' ? 'dark' : 'light';
+    document.documentElement.dataset.theme = t;
+    const meta = document.querySelector('meta[name="theme-color"]');
+    if (meta) meta.setAttribute('content', t === 'dark' ? '#0f1115' : '#f5f6f8');
+    try { localStorage.setItem(THEME_KEY, t); } catch {}
+  }
+
+  function initTheme() {
+    let saved = null;
+    try { saved = localStorage.getItem(THEME_KEY); } catch {}
+    const prefersDark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+    applyTheme(saved || (prefersDark ? 'dark' : 'light'));
+    for (const btn of document.querySelectorAll('.theme-toggle')) {
+      btn.addEventListener('click', () => {
+        applyTheme(document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark');
+      });
+    }
+  }
+
   async function boot() {
+    initTheme();
     bindUI();
+
+    // 個人中心：本機保存的暱稱／頭像，每次開啟自動帶入
+    state.profile = loadProfile();
+    if (state.profile.name) $('#nickname').value = state.profile.name;
+    renderLobbyAvatar();
+
     setBadge('就緒', 'on');
 
     const hostState = readStored(HOST_STATE_KEY);
@@ -2184,6 +2442,7 @@
 
     if (hostState && hostState.code && hostState.name && hostState.password && hostState.nickname) {
       // 房主重新整理：自動以同一組房間碼恢復房間，房間碼與密碼都不變
+      if (state.profile.name) hostState.nickname = state.profile.name; // 用最新暱稱
       setBadge('恢復房間中…', '');
       startHost(hostState, { restoring: true });
       return;
@@ -2192,6 +2451,7 @@
     if (clientState && clientState.code && clientState.password && clientState.nickname) {
       // 成員重新整理：自動重新加入同一個房間
       state.isHost = false;
+      if (state.profile.name) clientState.nickname = state.profile.name; // 用最新暱稱
       setBadge('重新加入房間中…', '');
       const ok = await tryRestoreClient(clientState);
       if (!ok) {

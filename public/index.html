@@ -3,11 +3,11 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <meta name="theme-color" content="#0a0c10">
+  <meta name="theme-color" content="#f5f6f8">
   <meta name="description" content="私密語音／螢幕分享房間：房間碼＋密碼加入，WebRTC 點對點加密，支援文字聊天與檔案傳送">
   <title>Room — 私密語音・螢幕分享・文字聊天</title>
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🏠</text></svg>">
-  <link rel="stylesheet" href="./css/style.css">
+  <link rel="stylesheet" href="./css/style.css?v=20260924">
 </head>
 <body>
 
@@ -34,11 +34,18 @@
     <symbol id="i-arrow-down" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><polyline points="19 12 12 19 5 12"/></symbol>
     <symbol id="i-plus" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></symbol>
     <symbol id="i-login" viewBox="0 0 24 24"><path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/><polyline points="10 17 15 12 10 7"/><line x1="15" y1="12" x2="3" y2="12"/></symbol>
+    <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><line x1="12" y1="1" x2="12" y2="4"/><line x1="12" y1="20" x2="12" y2="23"/><line x1="4.2" y1="4.2" x2="6.3" y2="6.3"/><line x1="17.7" y1="17.7" x2="19.8" y2="19.8"/><line x1="1" y1="12" x2="4" y2="12"/><line x1="20" y1="12" x2="23" y2="12"/><line x1="4.2" y1="19.8" x2="6.3" y2="17.7"/><line x1="17.7" y1="6.3" x2="19.8" y2="4.2"/></symbol>
+    <symbol id="i-moon" viewBox="0 0 24 24"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></symbol>
+    <symbol id="i-user" viewBox="0 0 24 24"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></symbol>
   </svg>
 
   <!-- ================= 大廳 ================= -->
   <div id="view-lobby" class="view">
     <header class="lobby-header">
+      <button class="ctl-icon theme-toggle" title="切換深淺色" aria-label="切換深淺色">
+        <svg class="ico icon-sun"><use href="#i-sun"/></svg>
+        <svg class="ico icon-moon"><use href="#i-moon"/></svg>
+      </button>
       <div class="brand">
         <span class="brand-mark"><svg class="ico"><use href="#i-home"/></svg></span>
         <h1>Room</h1>
@@ -51,9 +58,14 @@
       </div>
     </header>
 
-    <div class="nickname-row">
-      <label for="nickname">暱稱</label>
-      <input id="nickname" maxlength="20" placeholder="例如：小明" autocomplete="nickname">
+    <div class="profile-row">
+      <button id="btn-profile" class="avatar-btn" title="個人中心：設定暱稱與頭像" aria-label="個人中心">
+        <span id="lobby-avatar" class="avatar-circle small-avatar"></span>
+      </button>
+      <div class="nickname-row">
+        <label for="nickname">暱稱</label>
+        <input id="nickname" maxlength="20" placeholder="例如：小明" autocomplete="nickname">
+      </div>
     </div>
 
     <main class="cards">
@@ -106,6 +118,10 @@
         </div>
       </div>
       <div class="rh-right">
+        <button class="ctl-icon theme-toggle" title="切換深淺色" aria-label="切換深淺色">
+          <svg class="ico icon-sun"><use href="#i-sun"/></svg>
+          <svg class="ico icon-moon"><use href="#i-moon"/></svg>
+        </button>
         <button id="btn-settings" class="ctl-icon ghost hidden" title="房間設定" aria-label="房間設定"><svg class="ico"><use href="#i-settings"/></svg></button>
       </div>
     </header>
@@ -158,6 +174,31 @@
     <div id="audios" class="hidden"></div>
   </div>
 
+  <!-- ================= 個人中心彈窗 ================= -->
+  <div id="modal-profile" class="modal hidden">
+    <div class="modal-card">
+      <div class="modal-head">
+        <span class="card-ico"><svg class="ico"><use href="#i-user"/></svg></span>
+        <h2>個人中心</h2>
+      </div>
+      <div class="profile-edit">
+        <span id="profile-avatar-preview" class="avatar-circle small-avatar"></span>
+        <div class="profile-edit-btns">
+          <button id="btn-avatar-upload" class="ghost small-btn">上傳頭像</button>
+          <button id="btn-avatar-remove" class="ghost small-btn">移除頭像</button>
+        </div>
+        <input type="file" id="avatar-file" accept="image/*" hidden>
+      </div>
+      <label for="profile-name">暱稱</label>
+      <input id="profile-name" maxlength="20" placeholder="例如：小明" autocomplete="nickname">
+      <p class="muted small">暱稱與頭像保存在這部裝置上，下次開啟自動帶入；頭像會同步顯示給房間成員。</p>
+      <div class="modal-actions">
+        <button id="btn-profile-cancel" class="ghost">取消</button>
+        <button id="btn-profile-save" class="primary">儲存</button>
+      </div>
+    </div>
+  </div>
+
   <!-- ================= 房主設定彈窗 ================= -->
   <div id="modal-settings" class="modal hidden">
     <div class="modal-card">
@@ -181,6 +222,6 @@
   <div id="toasts"></div>
 
   <script src="./js/peerjs.min.js"></script>
-  <script src="./js/app.js"></script>
+  <script src="./js/app.js?v=20260924"></script>
 </body>
 </html>
