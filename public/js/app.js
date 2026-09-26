@@ -51,6 +51,12 @@
     micStream: null,
     micTrack: null,
     micMuted: false,
+    // 說話指示：本地用 AnalyserNode 量麥克風音量，遠端用 getStats 的 audioLevel
+    audioCtx: null,
+    micAnalyser: null,
+    speakingTimer: null,
+    localSpeaking: false,
+    remoteLevels: new Map(), // peerId -> 上次取樣的音量（0-1）
     screenStream: null,
     screenTrack: null,
     screenAudioTrack: null,
@@ -139,41 +145,111 @@
     try { localStorage.setItem(PROFILE_KEY, JSON.stringify(state.profile)); } catch {}
   }
 
-  /** 頭像圖片統一裁成 128×128 方形 JPEG（約 4-8KB），可直接放進 localStorage 與 P2P 訊息 */
-  function compressAvatar(file) {
+  /* ---------- 頭像裁剪器：拖動＋縮放，圓圈內即最終頭像 ---------- */
+
+  const CROP_VIEW = 240; // 預覽畫布邊長（px）
+  const CROP_OUT = 128;  // 輸出頭像邊長（px）
+  const CROP_RING = 190; // 圓形選框直徑（px）
+  const CROP_FILL = '#e9e9ee'; // 圖片縮小後、圓環內露出的底色
+
+  const avatarCrop = {
+    img: null,   // HTMLImageElement
+    url: null,   // object URL（關閉時釋放）
+    zoom: 1,     // 使用者縮放（1 = 剛好鋪滿視窗）
+    base: 1,     // 鋪滿視窗所需的基準縮放
+    x: 0,        // 平移量（相對置中，px @240 視窗）
+    y: 0,
+  };
+
+  function clampCrop() {
+    if (!avatarCrop.img) return;
+    const s = avatarCrop.base * avatarCrop.zoom;
+    const w = avatarCrop.img.naturalWidth * s;
+    const h = avatarCrop.img.naturalHeight * s;
+    // 平移以「圓環」為界：環內不得露出底色；圖片比圓環小時鎖在正中
+    const maxX = Math.max(0, (w - CROP_RING) / 2);
+    const maxY = Math.max(0, (h - CROP_RING) / 2);
+    avatarCrop.x = w <= CROP_RING ? 0 : Math.max(-maxX, Math.min(maxX, avatarCrop.x));
+    avatarCrop.y = h <= CROP_RING ? 0 : Math.max(-maxY, Math.min(maxY, avatarCrop.y));
+  }
+
+  function drawCrop() {
+    const cv = $('#crop-canvas');
+    if (!cv || !avatarCrop.img) return;
+    clampCrop();
+    const ctx = cv.getContext('2d');
+    ctx.fillStyle = CROP_FILL;
+    ctx.fillRect(0, 0, CROP_VIEW, CROP_VIEW);
+    const s = avatarCrop.base * avatarCrop.zoom;
+    const w = avatarCrop.img.naturalWidth * s;
+    const h = avatarCrop.img.naturalHeight * s;
+    ctx.drawImage(avatarCrop.img, (CROP_VIEW - w) / 2 + avatarCrop.x, (CROP_VIEW - h) / 2 + avatarCrop.y, w, h);
+  }
+
+  function loadCropImage(file) {
     return new Promise((resolve, reject) => {
       if (!file.type.startsWith('image/')) return reject(new Error('請選擇圖片檔'));
-      const url = URL.createObjectURL(file);
+      if (avatarCrop.url) URL.revokeObjectURL(avatarCrop.url);
+      avatarCrop.url = URL.createObjectURL(file);
       const img = new Image();
       img.onload = () => {
-        try {
-          const SIZE = 128;
-          const cv = document.createElement('canvas');
-          cv.width = SIZE;
-          cv.height = SIZE;
-          const ctx = cv.getContext('2d');
-          const s = Math.max(SIZE / img.width, SIZE / img.height);
-          const w = img.width * s;
-          const h = img.height * s;
-          ctx.drawImage(img, (SIZE - w) / 2, (SIZE - h) / 2, w, h);
-          resolve(cv.toDataURL('image/jpeg', 0.82));
-        } catch (err) {
-          reject(err);
-        } finally {
-          URL.revokeObjectURL(url);
-        }
+        avatarCrop.img = img;
+        avatarCrop.base = Math.max(CROP_VIEW / img.naturalWidth, CROP_VIEW / img.naturalHeight);
+        avatarCrop.zoom = 1;
+        avatarCrop.x = 0;
+        avatarCrop.y = 0;
+        // 縮放下限 = 整張圖剛好完整塞進圓環（對角線 = 環徑），確保頭像能「覆蓋完全」
+        const zFit = CROP_RING / (Math.hypot(img.naturalWidth, img.naturalHeight) * avatarCrop.base);
+        const slider = $('#crop-zoom');
+        slider.min = String(Math.max(1, Math.round(zFit * 100)));
+        slider.value = '100';
+        $('#avatar-crop').classList.remove('hidden');
+        drawCrop();
+        resolve();
       };
       img.onerror = () => {
-        URL.revokeObjectURL(url);
+        URL.revokeObjectURL(avatarCrop.url);
+        avatarCrop.url = null;
         reject(new Error('圖片載入失敗'));
       };
-      img.src = url;
+      img.src = avatarCrop.url;
     });
   }
 
-  /** 取某成員的頭像：自己用本機 profile，其他人用同步過來的 avatars 表 */
+  /** 依選框狀態輸出 128×128 頭像（取圓環範圍，與預覽完全一致） */
+  function generateAvatarFromCrop() {
+    if (!avatarCrop.img) return null;
+    const cv = document.createElement('canvas');
+    cv.width = CROP_OUT;
+    cv.height = CROP_OUT;
+    const ctx = cv.getContext('2d');
+    const k = CROP_OUT / CROP_RING;              // 圓環 → 輸出
+    const off = (CROP_VIEW - CROP_RING) / 2;     // 圓環在畫布內的偏移
+    ctx.fillStyle = CROP_FILL;
+    ctx.fillRect(0, 0, CROP_OUT, CROP_OUT);
+    const s = avatarCrop.base * avatarCrop.zoom;
+    const w = avatarCrop.img.naturalWidth * s;
+    const h = avatarCrop.img.naturalHeight * s;
+    ctx.drawImage(
+      avatarCrop.img,
+      ((CROP_VIEW - w) / 2 + avatarCrop.x - off) * k,
+      ((CROP_VIEW - h) / 2 + avatarCrop.y - off) * k,
+      w * k,
+      h * k
+    );
+    return cv.toDataURL('image/jpeg', 0.85);
+  }
+
+  function resetCrop() {
+    if (avatarCrop.url) URL.revokeObjectURL(avatarCrop.url);
+    avatarCrop.img = null;
+    avatarCrop.url = null;
+    $('#avatar-crop').classList.add('hidden');
+  }
+
+  /** 取某成員的頭像：自己用本機 profile，其他人用同步表 */
   function avatarFor(id) {
-    if (id === state.myId) return state.profile.avatar;
+    if (id === state.myId || id === '__self') return state.profile.avatar;
     return state.avatars.get(id) || null;
   }
 
@@ -193,21 +269,73 @@
     elm.style.setProperty('--h', nameHue(name));
   }
 
-  /** 大廳的頭像預覽跟著暱稱即時變動 */
-  function renderLobbyAvatar() {
-    const av = $('#lobby-avatar');
-    if (!av) return;
-    if (state.profile.avatar) {
-      av.textContent = '';
-      av.style.backgroundImage = `url("${state.profile.avatar}")`;
-      av.classList.add('avatar-img');
-      return;
+  /** 更新所有「自己」的頭像顯示：右上角個人中心膠囊、登入畫面 */
+  function renderIdentity() {
+    const name = state.profile.name;
+    for (const av of document.querySelectorAll('.profile-chip .chip-avatar, #login-avatar')) {
+      applyAvatar(av, '__self', name);
     }
-    av.style.backgroundImage = '';
-    av.classList.remove('avatar-img');
-    const name = $('#nickname').value.trim();
-    av.textContent = (name || '?').charAt(0).toUpperCase();
-    av.style.setProperty('--h', nameHue(name));
+    // 登入「新建身分」狀態：顯示暫選頭像，否則跟著輸入的暱稱即時變化
+    const newAv = $('#login-new-avatar');
+    if (newAv) {
+      if (loginPendingAvatar) {
+        newAv.textContent = '';
+        newAv.style.backgroundImage = `url("${loginPendingAvatar}")`;
+        newAv.classList.add('avatar-img');
+      } else {
+        newAv.style.backgroundImage = '';
+        newAv.classList.remove('avatar-img');
+        const typed = $('#login-nickname') ? $('#login-nickname').value.trim() : '';
+        newAv.textContent = (typed || '?').charAt(0).toUpperCase();
+        newAv.style.setProperty('--h', nameHue(typed));
+      }
+    }
+  }
+
+  /** 登出：清除本機身分與房間工作階段，回到登入畫面 */
+  async function logout() {
+    if (state.room) {
+      await leaveRoomUI(false); // 在房間內先正常離開（房主會廣播關房）
+    }
+    clearStoredState();
+    try { localStorage.removeItem(PROFILE_KEY); } catch {}
+    state.profile = { name: '', avatar: null };
+    state.nickname = '';
+    closeProfileModal();
+    showLogin('create');
+    toast('已登出', 'success');
+  }
+
+  /** 登入畫面的快速頭像：置中裁成 128×128（進個人中心可再精細調整） */
+  function fileToAvatarDataURL(file) {
+    return new Promise((resolve, reject) => {
+      if (!file.type.startsWith('image/')) return reject(new Error('請選擇圖片檔'));
+      const url = URL.createObjectURL(file);
+      const img = new Image();
+      img.onload = () => {
+        try {
+          const SIZE = 128;
+          const cv = document.createElement('canvas');
+          cv.width = SIZE;
+          cv.height = SIZE;
+          const ctx = cv.getContext('2d');
+          const s = Math.max(SIZE / img.width, SIZE / img.height);
+          const w = img.width * s;
+          const h = img.height * s;
+          ctx.drawImage(img, (SIZE - w) / 2, (SIZE - h) / 2, w, h);
+          resolve(cv.toDataURL('image/jpeg', 0.85));
+        } catch (err) {
+          reject(err);
+        } finally {
+          URL.revokeObjectURL(url);
+        }
+      };
+      img.onerror = () => {
+        URL.revokeObjectURL(url);
+        reject(new Error('圖片載入失敗'));
+      };
+      img.src = url;
+    });
   }
 
   /** 套用新暱稱／頭像：更新本機、房內名單，並廣播給其他成員 */
@@ -224,7 +352,7 @@
       broadcast({ type: 'profile', name, avatar: avatar || null });
       renderRoom();
     }
-    renderLobbyAvatar();
+    renderIdentity();
   }
 
   /** 房主端：目前房內所有人的頭像（自己用 profile，其他用同步表），排除指定成員 */
@@ -698,7 +826,7 @@
 
     const tile = tileEls.get(peerId);
     if (tile) {
-      tile.root.remove();
+      removeTileEl(tile);
       tileEls.delete(peerId);
     }
 
@@ -1155,6 +1283,7 @@
       state.micTrack = stream.getAudioTracks()[0];
       state.micMuted = false;
       for (const [, peer] of state.peers) peer.pc.addTrack(state.micTrack, stream);
+      startSpeakingMonitor();
       emitState();
       updateControlBar();
       toast('麥克風已開啟', 'success');
@@ -1162,6 +1291,92 @@
       stopMic();
       toast('麥克風已關閉');
     }
+  }
+
+  /* ---------- 說話指示燈 ---------- */
+
+  const SPEAK_RMS_ON = 0.055;   // 超過視為說話
+  const SPEAK_RMS_OFF = 0.038;  // 低於才熄燈（遲滯，避免閃爍）
+
+  function setTileSpeaking(id, on) {
+    const t = tileEls.get(id);
+    if (t) t.root.classList.toggle('speaking', on);
+  }
+
+  function startSpeakingMonitor() {
+    stopSpeakingMonitor();
+    try {
+      state.audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      const src = state.audioCtx.createMediaStreamSource(state.micStream);
+      const analyser = state.audioCtx.createAnalyser();
+      analyser.fftSize = 512;
+      src.connect(analyser);
+      state.micAnalyser = analyser;
+    } catch {
+      // 取不到 AnalyserNode 就只做遠端指示
+    }
+
+    let tick = 0;
+    const buf = new Uint8Array(256);
+    state.speakingTimer = setInterval(async () => {
+      tick++;
+
+      // 本地音量（RMS）
+      if (state.micAnalyser) {
+        if (state.micMuted) {
+          if (state.localSpeaking) {
+            state.localSpeaking = false;
+            setTileSpeaking(state.myId, false);
+          }
+        } else {
+          state.micAnalyser.getByteTimeDomainData(buf);
+          let sum = 0;
+          for (let i = 0; i < buf.length; i++) {
+            const v = (buf[i] - 128) / 128;
+            sum += v * v;
+          }
+          const rms = Math.sqrt(sum / buf.length);
+          const was = state.localSpeaking;
+          state.localSpeaking = was ? rms > SPEAK_RMS_OFF : rms > SPEAK_RMS_ON;
+          if (state.localSpeaking !== was) setTileSpeaking(state.myId, state.localSpeaking);
+        }
+      }
+
+      // 遠端音量：每 2 個 tick（約 600ms）取樣一次，夠流暢又不增加負擔
+      if (tick % 2 === 0) {
+        for (const [id, peer] of state.peers) {
+          let level = 0;
+          try {
+            const stats = await peer.pc.getStats();
+            stats.forEach((r) => {
+              if (r.type === 'inbound-rtp' && r.kind === 'audio' && typeof r.audioLevel === 'number') {
+                if (r.audioLevel > level) level = r.audioLevel;
+              }
+            });
+          } catch {}
+          const was = state.remoteLevels.get(id) > SPEAK_RMS_OFF;
+          const now = level > (was ? SPEAK_RMS_OFF : SPEAK_RMS_ON);
+          state.remoteLevels.set(id, level);
+          if (now !== was) setTileSpeaking(id, now);
+        }
+      }
+    }, 300);
+  }
+
+  function stopSpeakingMonitor() {
+    if (state.speakingTimer) {
+      clearInterval(state.speakingTimer);
+      state.speakingTimer = null;
+    }
+    if (state.audioCtx) {
+      try { state.audioCtx.close(); } catch {}
+      state.audioCtx = null;
+      state.micAnalyser = null;
+    }
+    state.localSpeaking = false;
+    if (state.myId) setTileSpeaking(state.myId, false);
+    for (const id of state.remoteLevels.keys()) setTileSpeaking(id, false);
+    state.remoteLevels.clear();
   }
 
   function stopMic() {
@@ -1176,6 +1391,7 @@
     state.micStream = null;
     state.micTrack = null;
     state.micMuted = false;
+    stopSpeakingMonitor();
     emitState();
     updateControlBar();
   }
@@ -1393,6 +1609,14 @@
     } catch {}
   }
 
+  function removeTileEl(tile) {
+    if (!tile || tile._leaving) return;
+    tile._leaving = true;
+    tile.root.classList.remove('speaking');
+    tile.root.classList.add('tile-leave');
+    setTimeout(() => tile.root.remove(), 170); // 與 tile-out 動畫同長
+  }
+
   function ensureTile(p) {
     let t = tileEls.get(p.id);
     if (t) return t;
@@ -1441,6 +1665,7 @@
     bottom.append(nameRow, stateEl);
 
     root.append(video, avatar, waiting, top, bottom);
+    root.classList.add('tile-enter'); // 入場動畫（CSS 播完即停）
     $('#tiles').appendChild(root);
 
     t = { root, video, avatarCircle, waitingEl: waiting, badgeOwner, badgeMic, badgeScreen, nameEl, stateEl, statsEl, attached: null };
@@ -1504,7 +1729,7 @@
 
     for (const [id, tile] of tileEls) {
       if (!seen.has(id)) {
-        tile.root.remove();
+        removeTileEl(tile);
         tileEls.delete(id);
       }
     }
@@ -1550,13 +1775,15 @@
   function scrollChat(force) {
     const box = $('#chat-messages');
     if (!box) return;
-    if (force) {
-      box.scrollTop = box.scrollHeight;
+    const nearBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 240;
+    if (force || (chat.atBottom && nearBottom)) {
+      // 訊息到達時平滑滑入；距離很遠（如剛開聊天欄）才直接跳到底
+      box.scrollTo({ top: box.scrollHeight, behavior: force && !nearBottom ? 'auto' : 'smooth' });
       chat.atBottom = true;
       hideJump();
       return;
     }
-    if (chat.atBottom) box.scrollTop = box.scrollHeight;
+    if (chat.atBottom) box.scrollTo({ top: box.scrollHeight, behavior: 'smooth' });
   }
 
   function noteIncoming() {
@@ -1889,12 +2116,76 @@
   /* ================= 進出房間 ================= */
 
   function showView(inRoom) {
-    $('#view-lobby').classList.toggle('hidden', inRoom);
-    $('#view-room').classList.toggle('hidden', !inRoom);
+    const lobby = $('#view-lobby');
+    const room = $('#view-room');
+    const changing = room.classList.contains('hidden') === inRoom; // 狀態真的要變才做過場
+    const apply = () => {
+      $('#view-login').classList.add('hidden');
+      lobby.classList.toggle('hidden', inRoom);
+      room.classList.toggle('hidden', !inRoom);
+    };
+    const reduced = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    if (changing && !reduced && typeof document.startViewTransition === 'function') {
+      document.startViewTransition(apply); // 新舊畫面交叉淡入，絲滑切換
+    } else {
+      apply();
+    }
+  }
+
+  /* ================= 登入（身分識別）================= */
+
+  let loginPendingAvatar = null; // 登入畫面上暫選的頭像
+
+  function showLogin(mode = 'auto') {
+    const known = mode === 'known' || (mode === 'auto' && !!state.profile.name);
+    $('#login-known').classList.toggle('hidden', !known);
+    $('#login-create').classList.toggle('hidden', known);
+    if (known) {
+      $('#login-name').textContent = state.profile.name;
+      $('#login-name2').textContent = state.profile.name;
+    } else {
+      loginPendingAvatar = null;
+      $('#login-nickname').value = '';
+    }
+    renderIdentity();
+    const lobby = $('#view-lobby');
+    const room = $('#view-room');
+    const login = $('#view-login');
+    const changing = !login.classList.contains('hidden') ? false : true;
+    const apply = () => {
+      login.classList.remove('hidden');
+      lobby.classList.add('hidden');
+      room.classList.add('hidden');
+    };
+    const reduced = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    if (changing && !reduced && typeof document.startViewTransition === 'function') {
+      document.startViewTransition(apply);
+    } else {
+      apply();
+    }
+  }
+
+  /** 登入完成 → 絲滑轉場到主頁 */
+  function completeLogin(name, avatar) {
+    applyMyProfile(name, avatar || null);
+    showView(false); // View Transition 交叉淡入進大廳
+  }
+
+  /** 按鈕變形：收縮成膠囊＋彈跳圓點，動畫完才執行後續（參考 SLATE 登入鈕） */
+  function loginMorph(btn, then) {
+    if (!btn || btn.classList.contains('loading')) return;
+    btn.style.width = btn.offsetWidth + 'px';
+    requestAnimationFrame(() => btn.classList.add('loading'));
+    setTimeout(() => {
+      btn.classList.remove('loading');
+      btn.style.width = '';
+      then();
+    }, 900);
   }
 
   function enterRoom() {
     showView(true);
+    renderIdentity(); // 房間頭像膠囊在恢復工作階段路徑也要渲染
     renderRoom();
     updateControlBar();
     startStats();
@@ -1954,6 +2245,7 @@
     state.room = null;
     state.myId = null;
     state.participants = [];
+    state.avatars.clear(); // 房間成員的頭像快取隨房間釋放（自己的 profile 保留）
     state.isHost = false;
     state.roomPassword = null;
     $('#btn-create').disabled = false;
@@ -2027,10 +2319,10 @@
   }
 
   function createRoom() {
-    const nickname = $('#nickname').value.trim();
+    const nickname = state.profile.name;
     const name = $('#create-name').value.trim();
     const password = $('#create-password').value;
-    if (!nickname) return toast('請先填寫暱稱', 'error');
+    if (!nickname) return toast('請先在右上角個人中心設定暱稱', 'error');
     if (!name) return toast('請填寫房間名稱', 'error');
     if (!password || password.length < 4) return toast('請設定至少 4 字的房間密碼', 'error');
 
@@ -2114,10 +2406,10 @@
   /* ================= 成員：加入 ================= */
 
   async function joinRoom() {
-    const nickname = $('#nickname').value.trim();
+    const nickname = state.profile.name;
     const code = $('#join-code').value.trim().toUpperCase();
     const password = $('#join-password').value;
-    if (!nickname) return toast('請先填寫暱稱', 'error');
+    if (!nickname) return toast('請先在右上角個人中心設定暱稱', 'error');
     if (!code) return toast('請填寫房間碼', 'error');
     if (!password) return toast('請填寫房間密碼', 'error');
 
@@ -2165,7 +2457,18 @@
   }
 
   function closeSettings() {
-    $('#modal-settings').classList.add('hidden');
+    closeModalAnim('#modal-settings');
+  }
+
+  /** 彈窗退場動畫：播完 fade-out 再掛 hidden */
+  function closeModalAnim(sel) {
+    const m = $(sel);
+    if (!m || m.classList.contains('hidden')) return;
+    m.classList.add('closing');
+    setTimeout(() => {
+      m.classList.add('hidden');
+      m.classList.remove('closing');
+    }, 170);
   }
 
   /* ================= 個人中心彈窗 ================= */
@@ -2189,21 +2492,25 @@
   }
 
   function openProfileModal() {
-    $('#profile-name').value = state.profile.name || $('#nickname').value.trim();
+    $('#profile-name').value = state.profile.name;
     pendingAvatar = state.profile.avatar;
+    resetCrop(); // 每次打開都是乾淨的裁剪狀態
     renderProfilePreview();
     $('#modal-profile').classList.remove('hidden');
   }
 
   function closeProfileModal() {
-    $('#modal-profile').classList.add('hidden');
+    resetCrop();
+    closeModalAnim('#modal-profile');
   }
 
   function saveProfileModal() {
     const name = $('#profile-name').value.trim();
     if (!name) return toast('請填寫暱稱', 'error');
+    // 有在裁剪器調整過圖片 → 以選框內容為準
+    if (avatarCrop.img) pendingAvatar = generateAvatarFromCrop();
     applyMyProfile(name, pendingAvatar);
-    $('#nickname').value = name;
+    resetCrop();
     closeProfileModal();
     toast('個人資料已儲存，下次開啟自動帶入', 'success');
   }
@@ -2248,9 +2555,14 @@
     $('#quality').addEventListener('change', onQualityChange);
     $('#btn-copy-code').addEventListener('click', async () => {
       if (!state.room) return;
+      const codeEl = $('#room-code');
       try {
         await navigator.clipboard.writeText(state.room.code);
         toast('已複製房間碼', 'success');
+        codeEl.classList.remove('flash');
+        void codeEl.offsetWidth; // 重啟動畫
+        codeEl.classList.add('flash');
+        setTimeout(() => codeEl.classList.remove('flash'), 700);
       } catch {
         toast('複製失敗，房間碼：' + state.room.code, 'error');
       }
@@ -2264,29 +2576,101 @@
     });
 
     /* ---------- 個人中心 ---------- */
-    $('#btn-profile').addEventListener('click', openProfileModal);
+    for (const chip of document.querySelectorAll('.profile-chip')) {
+      chip.addEventListener('click', openProfileModal);
+    }
     $('#btn-profile-cancel').addEventListener('click', closeProfileModal);
     $('#btn-profile-save').addEventListener('click', saveProfileModal);
     $('#modal-profile').addEventListener('click', (e) => {
       if (e.target === $('#modal-profile')) closeProfileModal();
     });
+    $('#btn-logout').addEventListener('click', logout);
     $('#btn-avatar-upload').addEventListener('click', () => $('#avatar-file').click());
     $('#btn-avatar-remove').addEventListener('click', () => {
       pendingAvatar = null;
+      resetCrop();
       renderProfilePreview();
     });
-    $('#avatar-file').addEventListener('change', async (e) => {
+    $('#avatar-file').addEventListener('change', (e) => {
       const file = e.target.files && e.target.files[0];
       e.target.value = '';
       if (!file) return;
-      try {
-        pendingAvatar = await compressAvatar(file);
-        renderProfilePreview();
-      } catch (err) {
-        toast(err.message || '頭像處理失敗', 'error');
-      }
+      loadCropImage(file)
+        .then(renderProfilePreview) // 預覽先用舊頭像，儲存時才套用選框結果
+        .catch((err) => toast(err.message || '頭像處理失敗', 'error'));
     });
-    $('#nickname').addEventListener('input', renderLobbyAvatar);
+    $('#crop-zoom').addEventListener('input', (e) => {
+      avatarCrop.zoom = Number(e.target.value) / 100;
+      drawCrop();
+    });
+
+    // 選框拖拽（滑鼠／觸控）
+    const stage = $('#crop-stage');
+    let dragging = false;
+    let lastX = 0;
+    let lastY = 0;
+    stage.addEventListener('pointerdown', (e) => {
+      if (!avatarCrop.img) return;
+      dragging = true;
+      lastX = e.clientX;
+      lastY = e.clientY;
+      try { stage.setPointerCapture(e.pointerId); } catch {} // 合成事件（測試／自動化）沒有活動指標，忽略
+    });
+    stage.addEventListener('pointermove', (e) => {
+      if (!dragging) return;
+      avatarCrop.x += e.clientX - lastX;
+      avatarCrop.y += e.clientY - lastY;
+      lastX = e.clientX;
+      lastY = e.clientY;
+      drawCrop();
+    });
+    const endDrag = () => { dragging = false; };
+    stage.addEventListener('pointerup', endDrag);
+    stage.addEventListener('pointercancel', endDrag);
+
+    /* ---------- 登入（身分識別） ---------- */
+    $('#btn-login-continue').addEventListener('click', (e) => {
+      loginMorph(e.currentTarget, () => completeLogin(state.profile.name, state.profile.avatar));
+    });
+    $('#btn-login-other').addEventListener('click', () => {
+      $('#login-known').classList.add('hidden');
+      $('#login-create').classList.remove('hidden');
+      loginPendingAvatar = null;
+      $('#login-nickname').value = '';
+      renderIdentity();
+      $('#login-nickname').focus();
+    });
+    $('#login-avatar-btn').addEventListener('click', () => $('#login-avatar-file').click());
+    $('#login-avatar-file').addEventListener('change', (e) => {
+      const file = e.target.files && e.target.files[0];
+      e.target.value = '';
+      if (!file) return;
+      fileToAvatarDataURL(file)
+        .then((dataUrl) => {
+          loginPendingAvatar = dataUrl;
+          renderIdentity();
+        })
+        .catch((err) => toast(err.message || '頭像處理失敗', 'error'));
+    });
+    $('#btn-login-start').addEventListener('click', (e) => {
+      const name = $('#login-nickname').value.trim();
+      if (!name) return toast('請填寫暱稱', 'error');
+      loginMorph(e.currentTarget, () => {
+        completeLogin(name, loginPendingAvatar);
+        toast(`歡迎，${name}！`, 'success');
+      });
+    });
+    $('#login-nickname').addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') $('#btn-login-start').click();
+    });
+    // 登入畫面的頭像預覽跟著輸入的暱稱即時變動（尚未有圖片時）
+    $('#login-nickname').addEventListener('input', () => {
+      if (loginPendingAvatar) return;
+      const av = $('#login-new-avatar');
+      const name = $('#login-nickname').value.trim();
+      av.textContent = (name || '?').charAt(0).toUpperCase();
+      av.style.setProperty('--h', nameHue(name));
+    });
 
     for (const id of ['create-name', 'create-password']) {
       $('#' + id).addEventListener('keydown', (e) => {
@@ -2408,9 +2792,10 @@
 
   function applyTheme(theme) {
     const t = theme === 'dark' ? 'dark' : 'light';
+    // 主題切換走純 CSS 顏色過渡：不做整頁快照，所有動畫連貫不中斷
     document.documentElement.dataset.theme = t;
     const meta = document.querySelector('meta[name="theme-color"]');
-    if (meta) meta.setAttribute('content', t === 'dark' ? '#0f1115' : '#f5f6f8');
+    if (meta) meta.setAttribute('content', t === 'dark' ? '#000000' : '#f2f2f7');
     try { localStorage.setItem(THEME_KEY, t); } catch {}
   }
 
@@ -2432,8 +2817,7 @@
 
     // 個人中心：本機保存的暱稱／頭像，每次開啟自動帶入
     state.profile = loadProfile();
-    if (state.profile.name) $('#nickname').value = state.profile.name;
-    renderLobbyAvatar();
+    renderIdentity();
 
     setBadge('就緒', 'on');
 
@@ -2441,7 +2825,7 @@
     const clientState = readStored(CLIENT_STATE_KEY);
 
     if (hostState && hostState.code && hostState.name && hostState.password && hostState.nickname) {
-      // 房主重新整理：自動以同一組房間碼恢復房間，房間碼與密碼都不變
+      // 房主重新整理：自動以同一組房間碼恢復房間，房間碼與密碼都不變（已登入，跳過登入畫面）
       if (state.profile.name) hostState.nickname = state.profile.name; // 用最新暱稱
       setBadge('恢復房間中…', '');
       startHost(hostState, { restoring: true });
@@ -2463,7 +2847,8 @@
       return;
     }
 
-    setBadge('就緒', 'on');
+    // 沒有房間工作階段：顯示登入／身分識別畫面（有存檔身分 → 歡迎回來）
+    showLogin('auto');
   }
 
   boot();
